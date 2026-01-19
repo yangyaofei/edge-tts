@@ -8,7 +8,7 @@ from app.core.security import verify_token
 router = APIRouter()
 
 @router.get("/voices", response_model=list[VoiceInfo], dependencies=[Depends(verify_token)])
-async def get_voices(engine: str = Query("edge", regex="^(edge|qwen)$")):
+async def get_voices(engine: str = Query("edge", pattern="^(edge|qwen)$")):
     if engine == "edge":
         voices = await EdgeTTSEngine.get_voices()
         # Transform edge_tts voice dict to our schema
