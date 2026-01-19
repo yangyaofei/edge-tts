@@ -1,5 +1,8 @@
 import edge_tts
+import logging
 from typing import AsyncGenerator
+
+logger = logging.getLogger(__name__)
 
 class EdgeTTSEngine:
     @staticmethod
@@ -15,7 +18,7 @@ class EdgeTTSEngine:
         """
         Generates an audio stream (mp3) from text.
         """
-        print(f"DEBUG: Starting generation for text: {text[:20]}...")
+        logger.debug(f"Starting generation for text: {text[:20]}...")
         communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
         
         count = 0
@@ -23,10 +26,10 @@ class EdgeTTSEngine:
             async for chunk in communicate.stream():
                 if chunk["type"] == "audio":
                     count += 1
-                    # print(f"DEBUG: Yielding audio chunk {count}, size={len(chunk['data'])}")
+                    # logger.debug(f"Yielding audio chunk {count}, size={len(chunk['data'])}")
                     yield chunk["data"]
         except Exception as e:
-            print(f"DEBUG: Error in generation: {e}")
+            logger.error(f"Error in generation: {e}")
             raise e
         
-        print(f"DEBUG: Generation finished. Total audio chunks: {count}")
+        logger.debug(f"Generation finished. Total audio chunks: {count}")
