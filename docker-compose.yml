@@ -7,12 +7,11 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # Map local key.env to container's .env for persistent SECRET_KEY
-      # Create an empty key.env file if it doesn't exist before running
-      - ./key.env:/app/.env
-    environment:
-      # SECRET_KEY will be loaded from the mounted .env file
-      - ACCESS_TOKEN_EXPIRE_MINUTES=43200 # 30 days
+      # Map local config directory for persistent settings
+      # config.env will be generated in ./config/config.env if it doesn't exist
+      - ./config:/app/config
+    #environment:
+    #  # SECRET_KEY will be loaded from the mounted .env file
     logging:
       driver: "json-file"
       options:

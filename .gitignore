@@ -27,6 +27,8 @@ extension/dist/
 
 # Docker
 .docker/
+config/
+
 
 # Temporary
 *.log
