@@ -1,7 +1,6 @@
 <template>
   <div class="container">
-    <div class="header">
-      <h2>TTS Bundles</h2>
+    <div class="header" style="justify-content: flex-end;">
       <button class="settings-btn" @click="showSettings = !showSettings">⚙️</button>
     </div>
     
@@ -192,12 +191,21 @@ async function fetchVoices() {
         const res = await fetch(getApiUrl('/tts/voices?engine=edge'), {
             headers: getHeaders()
         });
+        
+        if (res.status === 401) {
+            alert("认证失败，请检查 JWT Token 配置。\nAuthentication failed. Please check your JWT Token.");
+            showSettings.value = true;
+            return;
+        }
+        
         if (!res.ok) throw new Error("Failed to fetch voices");
         const data = await res.json();
         voiceList.value = data;
         saveSettings(); 
     } catch (e: any) {
         error.value = "Voice fetch failed: " + e.message;
+        alert("无法连接到后端，请配置后端地址。\nCannot connect to backend. Please configure backend URL.");
+        showSettings.value = true;
     } finally {
         isLoadingVoices.value = false;
     }
@@ -243,6 +251,12 @@ async function readPage() {
       body: JSON.stringify({ text })
     });
     
+    if (chunkRes.status === 401) {
+      alert("认证失败，请检查 JWT Token 配置。\nAuthentication failed. Please check your JWT Token.");
+      showSettings.value = true;
+      throw new Error("Unauthorized");
+    }
+
     if (!chunkRes.ok) throw new Error(`Backend error: ${chunkRes.statusText}`);
 
     const data = await chunkRes.json();
@@ -274,6 +288,12 @@ async function fetchAudioBlob(text: string): Promise<string> {
             rate: selectedRate.value
         })
     });
+
+    if (response.status === 401) {
+        alert("认证失败，请检查 JWT Token 配置。\nAuthentication failed. Please check your JWT Token.");
+        showSettings.value = true;
+        throw new Error("Unauthorized");
+    }
 
     if (!response.ok) throw new Error("TTS API Error");
     const blob = await response.blob();

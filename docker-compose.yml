@@ -6,7 +6,16 @@ services:
     container_name: edge-tts-backend
     ports:
       - "8000:8000"
+    volumes:
+      # Map local key.env to container's .env for persistent SECRET_KEY
+      # Create an empty key.env file if it doesn't exist before running
+      - ./key.env:/app/.env
     environment:
-      - SECRET_KEY=changethis_in_production_secret_key
+      # SECRET_KEY will be loaded from the mounted .env file
       - ACCESS_TOKEN_EXPIRE_MINUTES=43200 # 30 days
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
     restart: unless-stopped

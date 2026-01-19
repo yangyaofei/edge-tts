@@ -28,15 +28,21 @@ A powerful Text-to-Speech solution using Microsoft Edge's online TTS engine. It 
 ## Installation Methods
 
 ### Method 1: Docker (Recommended)
-1.  **Start Backend:**
+1.  **Prepare Key File (Optional but recommended):**
+    Create an empty file named `key.env` in the project root to persist your `SECRET_KEY`:
     ```bash
-    docker-compose up -d
+    touch key.env
     ```
-2.  **Get Token:**
+2.  **Start Backend:**
+    ```bash
+    docker compose up -d
+    ```
+3.  **Get Token:**
     View logs to find the **Admin Token**:
     ```bash
     docker logs edge-tts-backend
     ```
+    *Note: Logs are limited to 20MB with 3 rotations.*
 
 ### Method 2: Python Direct Run
 1.  **Install Dependencies:**
@@ -96,20 +102,26 @@ A powerful Text-to-Speech solution using Microsoft Edge's online TTS engine. It 
 
 - **本地免密**: 如果您的后端和插件运行在同一台机器上（即通过 `127.0.0.1` 访问），您 **无需设置 JWT Token** 即可直接使用。
 - **远程访问**: 如果后端部署在远程服务器，必须在插件设置中填入服务器生成的 JWT Token。
-- **持久化**: 后端在首次运行时会随机生成 `SECRET_KEY` 并保存至 `.env` 文件中。这意味着即便重启服务器，之前生成的 Token 依然有效。
+- **持久化**: 后端在首次运行时会随机生成 `SECRET_KEY` 并保存至 `.env` 文件中。通过挂载本地 `key.env` 文件，可以确保即便重启或重新创建容器，之前生成的 Token 依然有效。
 
 ## 安装方式
 
 ### 方法一：Docker 部署 (推荐)
-1.  **启动后端:**
+1.  **准备密钥文件 (可选但推荐):**
+    在项目根目录创建一个名为 `key.env` 的空文件，用于持久化存储 `SECRET_KEY`:
     ```bash
-    docker-compose up -d
+    touch key.env
     ```
-2.  **获取 Token:**
+2.  **启动后端:**
+    ```bash
+    docker compose up -d
+    ```
+3.  **获取 Token:**
     查看容器日志以获取 **Admin Token**:
     ```bash
     docker logs edge-tts-backend
     ```
+    *注：日志文件限制为最大 20MB，保留 3 个历史文件。*
 
 ### 方法二：Python 直接运行
 1.  **安装依赖:**
