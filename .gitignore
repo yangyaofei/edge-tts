@@ -1,0 +1,33 @@
+# General
+.DS_Store
+.idea/
+.vscode/
+
+# Python / Backend
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+.venv/
+env/
+venv/
+backend/.env
+backend/venv/
+backend/.venv/
+
+# Node.js / Extension
+node_modules/
+dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+extension/node_modules/
+extension/dist/
+
+# Docker
+.docker/
+
+# Temporary
+*.log
+tmp/
