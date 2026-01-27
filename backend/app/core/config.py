@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings
+from typing import Literal
 
 import secrets
 import os
@@ -57,13 +58,26 @@ from typing import Optional
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Edge TTS"
     API_V1_STR: str = "/api/v1"
-    
+
     # Security
     SECRET_KEY: str # Will be loaded from .env
     ACCESS_TOKEN_EXPIRE_MINUTES: Optional[int] = None # Default to None (No expiration)
 
     # CORS Configuration
     BACKEND_CORS_ORIGINS: list[str] = ["*"] # Allow all for local dev, restrict in production
+
+    # ===================================================================
+    # Qwen3-TTS Configuration
+    # ===================================================================
+    QWEN_ENABLE: bool = True  # 是否启用 Qwen3-TTS
+    QWEN_MODEL_TYPE: Literal["CustomVoice", "Base", "VoiceDesign"] = "CustomVoice"
+    QWEN_MODEL_SIZE: Literal["0.6B", "1.7B"] = "1.7B"  # 使用较大的模型
+    QWEN_DEVICE: Optional[str] = None  # None=自动检测 (CUDA>MPS>CPU), 可指定 cuda:0, mps, cpu
+    QWEN_MAX_NEW_TOKENS: int = 2048  # 最大生成 token 数
+
+    # Hugging Face Configuration
+    HF_TOKEN: Optional[str] = None  # Hugging Face token (用于下载私有模型)
+    HF_ENDPOINT: Optional[str] = None  # HF mirror URL (如 https://hf-mirror.com)
 
     class Config:
         case_sensitive = True

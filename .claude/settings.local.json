@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source:*)",
+      "Bash(python:*)",
+      "Bash(brew install:*)",
+      "Bash(uvicorn:*)",
+      "Bash(PYTHONPATH=/Users/yangyaofei/workspace/tts-bundles/backend:$PYTHONPATH uvicorn:*)",
+      "Bash(python3.13:*)",
+      "Bash(lsof:*)",
+      "Bash(xargs kill -9 sleep 2 echo:*)",
+      "Bash(curl:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}
