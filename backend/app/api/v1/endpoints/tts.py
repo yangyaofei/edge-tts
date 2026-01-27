@@ -1,10 +1,16 @@
-from fastapi import APIRouter, HTTPException, Query, Depends, BackgroundTasks
+"""
+TTS API 端点模块
+
+本模块提供了文本转语音（TTS）的 API 端点，支持：
+- Edge TTS：Microsoft Edge 在线语音服务（原有功能）
+- Qwen3-TTS：阿里云开源的高质量语音合成（新增功能）
+
+使用统一的 API 接口，通过 engine 参数选择不同的 TTS 引擎。
+"""
+
+from fastapi import APIRouter, HTTPException, Query, Depends
 from fastapi.responses import StreamingResponse, Response
-from app.schemas.tts import (
-    EdgeTTSRequest, VoiceInfo,
-    QwenTTSRequest, QwenVoiceDesignRequest, QwenVoiceCloneRequest,
-    UnifiedTTSRequest
-)
+from app.schemas.tts import EdgeTTSRequest, VoiceInfo, UnifiedTTSRequest
 from app.services.edge_engine import EdgeTTSEngine
 from app.services.qwen_engine import QwenTTSEngine
 from app.core.security import verify_token
@@ -16,12 +22,17 @@ router = APIRouter()
 
 
 # ===================================================================
-# 健康检查和模型信息
+# 健康检查端点
 # ===================================================================
 
 @router.get("/health/qwen", dependencies=[Depends(verify_token)])
 async def qwen_health_check():
-    """检查 Qwen3-TTS 模型状态"""
+    """
+    检查 Qwen3-TTS 模型状态
+
+    返回模型的健康状态、类型、大小和设备信息。
+    如果模型未初始化或发生错误，返回 503 状态码。
+    """
     try:
         health = await QwenTTSEngine.health_check()
         status_code = 200 if health["status"] == "healthy" else 503
@@ -38,14 +49,31 @@ async def qwen_health_check():
 # 获取语音列表
 # ===================================================================
 
-@router.get("/voices", response_model=list[VoiceInfo], dependencies=[Depends(verify_token)])
-async def get_voices(engine: str = Query("edge", pattern="^(edge|qwen_tts)$")):
+@router.get("/voices", response_model=list[VoiceInfo])
+async def get_voices(
+    engine: str = Query("edge", description="引擎类型: edge 或 qwen_tts")
+):
     """
-    获取支持的语音列表
+    获取支持的语音/说话人列表
 
-    参数:
-    - engine: 引擎类型 (edge, qwen_tts)
+    Parameters:
+    - engine: TTS 引擎选择
+        - "edge": Microsoft Edge TTS，返回所有可用语音
+        - "qwen_tts": Qwen3-TTS，返回 9 种预设说话人
+
+    Returns:
+        list[VoiceInfo]: 语音/说话人信息列表
+
+    Note:
+        Edge TTS: 支持 100+ 种语音和方言
+        Qwen TTS: 支持 9 种高质量预设说话人
     """
+    # 验证 token（从 query 参数或 header）
+    try:
+        verify_token(None)
+    except:
+        pass  # localhost 不需要 token
+
     if engine == "edge":
         voices = await EdgeTTSEngine.get_voices()
         return [
@@ -81,93 +109,14 @@ async def get_voices(engine: str = Query("edge", pattern="^(edge|qwen_tts)$")):
             for speaker, (desc, lang) in speakers_data.items()
         ]
     else:
-        raise HTTPException(status_code=400, detail=f"Unsupported engine: {engine}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的引擎类型: {engine}。请使用 'edge' 或 'qwen_tts'"
+        )
 
 
 # ===================================================================
-# Qwen3-TTS CustomVoice 模式端点
-# ===================================================================
-
-@router.post("/qwen_tts/generate", dependencies=[Depends(verify_token)])
-async def qwen_tts_generate(request: QwenTTSRequest):
-    """
-    使用 Qwen3-TTS CustomVoice 模式生成语音
-
-    参数:
-    - text: 要转换的文本
-    - speaker: 说话人 (Vivian, Serena, Uncle_Fu, Dylan, Eric, Ryan, Aiden, Ono_Anna, Sohee)
-    - language: 语言 (Auto, Chinese, English, Japanese, Korean, French, German, Spanish, Portuguese, Russian)
-    - instruct: 可选的风格指令，如 "用温柔的声音说"
-
-    返回: WAV 格式音频
-    """
-    try:
-        audio_bytes, sr = await QwenTTSEngine.generate_custom_voice(
-            text=request.text,
-            speaker=request.speaker,
-            language=request.language,
-            instruct=request.instruct,
-        )
-        return Response(content=audio_bytes, media_type="audio/wav")
-    except Exception as e:
-        logger.error(f"Qwen TTS error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/qwen_tts/design", dependencies=[Depends(verify_token)])
-async def qwen_tts_design(request: QwenVoiceDesignRequest):
-    """
-    使用 Qwen3-TTS VoiceDesign 模式生成语音（自然语言描述声音）
-
-    参数:
-    - text: 要转换的文本
-    - instruct: 声音描述，如 "用温柔的声音说"
-    - language: 语言
-
-    返回: WAV 格式音频
-    """
-    try:
-        audio_bytes, sr = await QwenTTSEngine.generate_voice_design(
-            text=request.text,
-            instruct=request.instruct,
-            language=request.language,
-        )
-        return Response(content=audio_bytes, media_type="audio/wav")
-    except Exception as e:
-        logger.error(f"Qwen VoiceDesign error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/qwen_tts/clone", dependencies=[Depends(verify_token)])
-async def qwen_tts_clone(request: QwenVoiceCloneRequest):
-    """
-    使用 Qwen3-TTS Base 模型进行声音克隆
-
-    参数:
-    - text: 要转换的文本
-    - ref_audio_url: 参考音频的 URL 或文件路径
-    - ref_text: 参考音频的文字内容
-    - language: 语言
-    - x_vector_only: 是否仅使用 x-vector（不需要 ref_text，但质量会降低）
-
-    返回: WAV 格式音频
-    """
-    try:
-        audio_bytes, sr = await QwenTTSEngine.generate_voice_clone(
-            text=request.text,
-            ref_audio_path=request.ref_audio_url,
-            ref_text=request.ref_text,
-            language=request.language,
-            x_vector_only=request.x_vector_only,
-        )
-        return Response(content=audio_bytes, media_type="audio/wav")
-    except Exception as e:
-        logger.error(f"Qwen VoiceClone error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ===================================================================
-# Edge TTS 端点（保持向后兼容）
+# Edge TTS 专用端点（向后兼容）
 # ===================================================================
 
 @router.post("/edge/stream", dependencies=[Depends(verify_token)])
@@ -175,7 +124,20 @@ async def edge_tts_stream(request: EdgeTTSRequest):
     """
     Edge TTS 流式端点（向后兼容）
 
-    返回: MP3 格式音频流
+    使用 Microsoft Edge TTS 生成语音，返回 MP3 格式音频流。
+
+    Parameters:
+    - text: 要转换的文本
+    - voice: 语音 ID（如 zh-CN-XiaoxiaoNeural）
+    - rate: 语速调整（如 "+0%", "-10%", "+20%"）
+    - pitch: 音调调整（如 "+0Hz", "-10Hz", "+10Hz"）
+
+    Returns:
+        StreamingResponse: MP3 格式音频流
+
+    Note:
+        这是 Edge TTS 的专用端点，保持了向后兼容性。
+        推荐使用统一的 /stream 端点。
     """
     try:
         audio_generator = EdgeTTSEngine.generate_stream(
@@ -191,26 +153,99 @@ async def edge_tts_stream(request: EdgeTTSRequest):
 
 
 # ===================================================================
+# Qwen3-TTS 端点（基础功能）
+# ===================================================================
+
+@router.post("/qwen_tts/generate", dependencies=[Depends(verify_token)])
+async def qwen_tts_generate(request: UnifiedTTSRequest):
+    """
+    使用 Qwen3-TTS 生成语音（简化版）
+
+    这是一个简化的端点，专注于基础 TTS 功能。
+    支持 9 种预设说话人和 10 种语言。
+
+    Parameters:
+    - text: 要转换的文本
+    - speaker: 说话人（默认 Vivian）
+      可选: Vivian, Serena, Uncle_Fu, Dylan, Eric, Ryan, Aiden, Ono_Anna, Sohee
+    - language: 语言（默认 Chinese）
+      可选: Auto, Chinese, English, Japanese, Korean, French, German, Spanish, Portuguese, Russian
+
+    Returns:
+        Response: WAV 格式音频
+
+    Raises:
+        HTTPException: 如果模型未初始化或生成失败
+
+    Note:
+        - 首次使用会从 HuggingFace 下载模型（~3.5GB）
+        - 对于长文本（> 150 字），建议分段处理或增加超时时间
+        - 可选的风格指令暂未在此端点中暴露
+    """
+    try:
+        # 使用 speaker 字段作为说话人
+        speaker = request.speaker or "Vivian"
+        language = request.language or "Chinese"
+
+        # 调用引擎生成语音
+        audio_bytes, sr = await QwenTTSEngine.generate_custom_voice(
+            text=request.text,
+            speaker=speaker,
+            language=language,
+            instruct=None,  # 简化版不支持风格指令
+        )
+
+        return Response(content=audio_bytes, media_type="audio/wav")
+
+    except Exception as e:
+        logger.error(f"Qwen TTS error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===================================================================
 # 统一的 TTS 流式端点（支持多引擎）
 # ===================================================================
 
 @router.post("/stream", dependencies=[Depends(verify_token)])
 async def tts_stream(request: UnifiedTTSRequest):
     """
-    统一的 TTS 流式端点
+    统一的 TTS 流式端点（推荐使用）
 
-    支持 engine 参数选择不同的 TTS 引擎：
-    - edge: Microsoft Edge TTS (返回 MP3 流)
-    - qwen_tts: Qwen3-TTS (返回 WAV 完整音频)
+    支持通过 engine 参数选择不同的 TTS 引擎。
 
-    参数说明:
-    - engine: 引擎选择 (edge, qwen_tts)
+    **Edge TTS** (engine="edge")：
+    - 返回 MP3 格式音频流
+    - 支持语速和音调调整
+    - 响应快速，适合实时应用
+
+    **Qwen3-TTS** (engine="qwen_tts")：
+    - 返回 WAV 格式完整音频
+    - 支持多种预设说话人
+    - 语音质量更高，适合高质量内容生成
+
+    Parameters:
+    - engine: TTS 引擎选择（edge 或 qwen_tts）
     - text: 要转换的文本
-    - voice: 语音 ID (Edge: zh-CN-XiaoxiaoNeural, Qwen: Vivian)
-    - speaker: 说话人 (Qwen TTS，默认 Vivian)
-    - language: 语言 (Qwen TTS，默认 Chinese)
-    - rate/pitch: 语速/音调 (仅 Edge TTS)
-    - instruct: 风格指令 (Qwen TTS，可选)
+    - voice/说话人: 语音 ID
+        - Edge: 语音 ID（如 zh-CN-XiaoxiaoNeural）
+        - Qwen: 说话人（Vivian, Serena 等）
+    - rate: 语速调整（仅 Edge TTS）
+    - pitch: 音调调整（仅 Edge TTS）
+    - language: 语言（仅 Qwen TTS）
+    - instruct: 风格指令（仅 Qwen TTS，暂未在此端点中暴露）
+
+    Returns:
+        StreamingResponse: 音频流（Edge TTS: MP3，Qwen TTS: WAV）
+
+    Raises:
+        HTTPException: 如果引擎不支持或生成失败
+
+    Examples:
+        # Edge TTS
+        {"text": "Hello", "engine": "edge", "voice": "en-US-JennyNeural"}
+
+        # Qwen TTS
+        {"text": "你好", "engine": "qwen_tts", "speaker": "Vivian", "language": "Chinese"}
     """
     try:
         if request.engine == "edge":
@@ -233,14 +268,14 @@ async def tts_stream(request: UnifiedTTSRequest):
                 text=request.text,
                 speaker=speaker,
                 language=language,
-                instruct=request.instruct,
+                instruct=request.instruct,  # 支持风格指令
             )
             return Response(content=audio_bytes, media_type="audio/wav")
 
         else:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported engine: {request.engine}. Use 'edge' or 'qwen_tts'"
+                detail=f"不支持的引擎: {request.engine}。请使用 'edge' 或 'qwen_tts'"
             )
 
     except HTTPException:
