@@ -10,7 +10,8 @@
       "Bash(lsof:*)",
       "Bash(xargs kill -9 sleep 2 echo:*)",
       "Bash(curl:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ]
   }
 }

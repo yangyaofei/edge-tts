@@ -1,3 +1,16 @@
+"""
+Qwen3-TTS 引擎模块
+
+本模块提供了 Qwen3-TTS 文本转语音模型的集成封装，支持：
+- 多种设备后端：CUDA (NVIDIA GPU)、MPS (Apple Silicon)、CPU
+- 多种模型类型：CustomVoice（预设音色）、Base（声音克隆）、VoiceDesign（声音设计）
+- 自动设备检测和最优数据类型选择
+- 线程安全的模型单例管理
+
+作者：Claude AI
+创建时间：2026-01-26
+"""
+
 import torch
 import logging
 import io
@@ -8,12 +21,26 @@ from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
 
+# ============================================================================
 # 类型定义
-ModelType = Literal["CustomVoice", "Base", "VoiceDesign"]
-ModelSize = Literal["0.6B", "1.7B"]
-Language = Literal["Auto", "Chinese", "English", "Japanese", "Korean", "French", "German", "Spanish", "Portuguese", "Russian"]
+# ============================================================================
 
-# CustomVoice 支持的说话人
+# 支持的模型类型
+ModelType = Literal["CustomVoice", "Base", "VoiceDesign"]
+# - CustomVoice: 9 种预设高质量说话人，支持指令控制
+# - Base: 支持 3 秒音频快速克隆声音
+# - VoiceDesign: 通过自然语言描述设计自定义声音
+
+# 支持的模型大小
+ModelSize = Literal["0.6B", "1.7B"]
+# - 0.6B: 轻量级模型，适合资源受限环境
+# - 1.7B: 高质量模型，推荐用于生产环境
+
+# 支持的语言
+Language = Literal["Auto", "Chinese", "English", "Japanese", "Korean",
+                   "French", "German", "Spanish", "Portuguese", "Russian"]
+
+# CustomVoice 模型支持的预设说话人列表
 CUSTOM_VOICE_SPEAKERS = [
     "Vivian",      # 明亮、略带棱角的年轻女性声音 (中文)
     "Serena",      # 温柔、温和的年轻女性声音 (中文)
@@ -26,6 +53,7 @@ CUSTOM_VOICE_SPEAKERS = [
     "Sohee",       # 温暖情感丰富的韩国女性声音 (韩语)
 ]
 
+# 说话人描述映射（用于文档和 API 响应）
 SPEAKER_DESCRIPTIONS = {
     "Vivian": "Bright, slightly edgy young female voice",
     "Serena": "Warm, gentle young female voice",
@@ -40,20 +68,44 @@ SPEAKER_DESCRIPTIONS = {
 
 
 class QwenTTSEngine:
-    """Qwen3-TTS 引擎，支持 CUDA 和 MPS"""
+    """
+    Qwen3-TTS 引擎类
 
-    _model: Optional["Qwen3TTSModel"] = None
-    _model_type: Optional[ModelType] = None
-    _model_size: Optional[ModelSize] = None
-    _device: Optional[str] = None
-    _lock: asyncio.Lock = asyncio.Lock()
+    这是一个单例类，管理 Qwen3-TTS 模型的加载、初始化和推理。
+    支持自动设备检测（CUDA > MPS > CPU）和最优数据类型选择。
+
+    特性：
+    - 线程安全的模型加载和访问
+    - 自动设备检测和优化
+    - 支持三种模式：CustomVoice、Base、VoiceDesign
+    - 统一的语音生成接口
+
+    使用示例：
+        >>> await QwenTTSEngine.initialize(model_type="CustomVoice", model_size="1.7B")
+        >>> audio_bytes, sr = await QwenTTSEngine.generate_custom_voice("你好", "Vivian")
+    """
+
+    # 类变量（单例模式）
+    _model: Optional["Qwen3TTSModel"] = None  # 已加载的模型实例
+    _model_type: Optional[ModelType] = None    # 当前模型类型
+    _model_size: Optional[ModelSize] = None    # 当前模型大小
+    _device: Optional[str] = None             # 当前使用的设备
+    _lock: asyncio.Lock = asyncio.Lock()      # 异步锁，保证线程安全
 
     @classmethod
     def get_available_device(cls) -> str:
         """
-        自动检测可用的最佳设备
+        自动检测并返回可用的最佳设备
 
-        优先级: CUDA > MPS > CPU
+        设备优先级：CUDA > MPS > CPU
+
+        Returns:
+            str: 设备标识符 ("cuda:0", "mps", 或 "cpu")
+
+        Note:
+            - CUDA: NVIDIA GPU，使用 bfloat16 获得最佳性能
+            - MPS: Apple Silicon GPU (M1/M2/M3/M4)，使用 float16
+            - CPU: 降级选项，速度较慢但无硬件要求
         """
         if torch.cuda.is_available():
             device = "cuda:0"
@@ -72,9 +124,16 @@ class QwenTTSEngine:
         """
         根据设备选择最优的数据类型
 
-        MPS: float16 (更稳定)
-        CUDA: bfloat16 (更好性能)
-        CPU: float32
+        Args:
+            device: 设备标识符
+
+        Returns:
+            torch.dtype: 推荐的数据类型
+
+        Note:
+            - MPS: 使用 float16（更稳定，bfloat16 支持不完善）
+            - CUDA: 使用 bfloat16（更好性能和精度）
+            - CPU: 使用 float32（稳定性）
         """
         if device == "mps":
             # MPS 对 bfloat16 支持不完善，使用 float16
@@ -97,12 +156,33 @@ class QwenTTSEngine:
         device: Optional[str] = None,
     ):
         """
-        初始化 Qwen3-TTS 模型
+        初始化 Qwen3-TTS 模型（单例模式）
+
+        这是模型加载的入口点，会自动检测设备、选择最优数据类型，
+        并加载模型到内存。使用单例模式确保全局只有一个模型实例。
 
         Args:
-            model_type: 模型类型 (CustomVoice, Base, VoiceDesign)
-            model_size: 模型大小 (0.6B, 1.7B)
-            device: 设备 (None=自动检测, cuda:0, mps, cpu)
+            model_type: 模型类型
+                - "CustomVoice": 预设 9 种说话人，支持指令控制（推荐）
+                - "Base": 声音克隆模型，需要参考音频
+                - "VoiceDesign": 自然语言声音设计
+            model_size: 模型大小
+                - "1.7B": 高质量模型，推荐用于生产环境（默认）
+                - "0.6B": 轻量级模型，适合资源受限环境
+            device: 设备标识符（None=自动检测）
+                - None: 自动检测 CUDA > MPS > CPU
+                - "cuda:0": 强制使用第一块 NVIDIA GPU
+                - "mps": 强制使用 Apple Silicon GPU
+                - "cpu": 强制使用 CPU（速度慢）
+
+        Raises:
+            RuntimeError: 如果 qwen-tts 包未安装
+            Exception: 如果模型加载失败
+
+        Note:
+            - 首次调用会从 HuggingFace 下载模型（约 3.5GB）
+            - 模型会缓存在 ~/.cache/huggingface/ 目录
+            - 使用双重检查锁定模式，支持并发调用
         """
         if cls._model is not None:
             logger.warning(f"Model already initialized: {cls._model_type}-{cls._model_size} on {cls._device}")
@@ -115,7 +195,7 @@ class QwenTTSEngine:
         # 选择最优数据类型
         dtype = cls.get_optimal_dtype(device)
 
-        # 构建模型名称
+        # 构建模型名称（HuggingFace 格式）
         model_name = f"Qwen/Qwen3-TTS-12Hz-{model_size}-{model_type}"
 
         logger.info(f"Loading Qwen3-TTS model: {model_name}")
@@ -130,11 +210,12 @@ class QwenTTSEngine:
                 # 动态导入（避免启动时就依赖 qwen-tts）
                 from qwen_tts import Qwen3TTSModel
 
+                # 加载模型
                 cls._model = Qwen3TTSModel.from_pretrained(
                     model_name,
                     device_map=device,
                     dtype=dtype,
-                    # attn_implementation="flash_attention_2",  # 如果安装了 FlashAttention 2
+                    # attn_implementation="flash_attention_2",  # 如果安装了 FlashAttention 2，启用它以减少内存占用
                 )
                 cls._model_type = model_type
                 cls._model_size = model_size
