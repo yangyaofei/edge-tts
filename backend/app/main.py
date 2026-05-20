@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
-from app.api.v1.endpoints import tts, text
+from app.api.v1.endpoints import tts, text, openai_tts
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -20,6 +20,7 @@ if settings.BACKEND_CORS_ORIGINS:
 
 app.include_router(tts.router, prefix=f"{settings.API_V1_STR}/tts", tags=["tts"])
 app.include_router(text.router, prefix=f"{settings.API_V1_STR}/text", tags=["text"])
+app.include_router(openai_tts.router, tags=["openai"])
 
 from datetime import timedelta
 from app.core.security import create_access_token

@@ -58,15 +58,16 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "Edge TTS"
     API_V1_STR: str = "/api/v1"
     
-    # Security
-    SECRET_KEY: str # Will be loaded from .env
-    ACCESS_TOKEN_EXPIRE_MINUTES: Optional[int] = None # Default to None (No expiration)
+    SECRET_KEY: str
+    ACCESS_TOKEN_EXPIRE_MINUTES: Optional[int] = None
 
-    # CORS Configuration
-    BACKEND_CORS_ORIGINS: list[str] = ["*"] # Allow all for local dev, restrict in production
+    BACKEND_CORS_ORIGINS: list[str] = ["*"]
+
+    VOLCENGINE_API_KEY: str = ""
+    VOLCENGINE_APP_ID: str = ""
+    VOLCENGINE_ACCESS_TOKEN: str = ""
 
     class Config:
         case_sensitive = True
-        # env_file is now handled dynamically in instantiation
 
 settings = Settings(_env_file=str(config_path))
