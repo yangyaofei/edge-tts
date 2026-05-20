@@ -244,24 +244,22 @@ async def synthesize(text: str, headers: dict, output_path: str,
                 break
             if mt == MsgType.Error or (mt == MsgType.FullServerResponse and ev == EventType.SessionFailed):
                 raise RuntimeError(f"session start failed: {pl.decode('utf-8', 'ignore')}")
-        logger.info("session started, sending text via multiple TaskRequests")
-
-        paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
-        logger.info(f"sending {len(paragraphs)} paragraph(s) in single session, total {len(text)} chars")
+        logger.info("session started, sending text character-by-character")
+        logger.info(f"sending {len(text)} chars in single session")
 
         async def send_all_text():
-            for para in paragraphs:
+            for ch in text:
                 task_req = {
                     "user": {"uid": str(uuid.uuid4())},
                     "namespace": "BidirectionalTTS",
                     "event": EventType.TaskRequest,
                     "req_params": {
                         **base_req_params,
-                        "text": para,
+                        "text": ch,
                     },
                 }
                 await ws.send(_build_frame(EventType.TaskRequest, session_id, json.dumps(task_req).encode()))
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0.005)
             await ws.send(_build_frame(EventType.FinishSession, session_id, b"{}"))
 
         send_task = asyncio.create_task(send_all_text())

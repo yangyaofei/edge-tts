@@ -47,7 +47,7 @@ OPENAI_VOICES = [
     {"id": "sage", "name": "Sage (云舟)", "engine": "volcengine", "locale": "zh-CN"},
 ]
 
-HTTP_TEXT_LIMIT = 2000
+WS_TEXT_THRESHOLD = 800
 
 
 class VolcengineTTSEngine:
@@ -67,7 +67,7 @@ class VolcengineTTSEngine:
     async def generate_stream(
         self, text: str, voice: str, speed: float = 1.0, audio_format: str = "mp3",
     ) -> AsyncGenerator[bytes, None]:
-        if len(text) <= HTTP_TEXT_LIMIT:
+        if len(text) <= WS_TEXT_THRESHOLD:
             async for chunk in self._http_stream(text, voice, speed, audio_format):
                 yield chunk
         else:
@@ -180,27 +180,14 @@ class VolcengineTTSEngine:
                 if mt == MsgType.Error or (mt == MsgType.FullServerResponse and ev == EventType.SessionFailed):
                     raise RuntimeError(f"volcengine WS session failed: {pl.decode('utf-8', 'ignore')}")
 
-            max_chunk = 800
-            paragraphs = []
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                while len(line) > max_chunk:
-                    paragraphs.append(line[:max_chunk])
-                    line = line[max_chunk:]
-                paragraphs.append(line)
-
             async def send_all():
-                for para in paragraphs:
-                    task_req = {
-                        "user": {"uid": str(uuid.uuid4())},
-                        "namespace": "BidirectionalTTS",
-                        "event": EventType.TaskRequest,
-                        "req_params": {**req_params, "text": para},
-                    }
-                    await ws.send(_build_frame(EventType.TaskRequest, session_id, json.dumps(task_req).encode()))
-                    await asyncio.sleep(0.01)
+                task_req = {
+                    "user": {"uid": str(uuid.uuid4())},
+                    "namespace": "BidirectionalTTS",
+                    "event": EventType.TaskRequest,
+                    "req_params": {**req_params, "text": text},
+                }
+                await ws.send(_build_frame(EventType.TaskRequest, session_id, json.dumps(task_req).encode()))
                 await ws.send(_build_frame(EventType.FinishSession, session_id, b"{}"))
 
             send_task = asyncio.create_task(send_all())
