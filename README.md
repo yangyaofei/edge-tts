@@ -7,17 +7,48 @@
 <a name="english"></a>
 # Edge TTS
 
-A powerful Text-to-Speech solution using Microsoft Edge's online TTS engine. It consists of a **Python Backend** (FastAPI) and a **Chrome Extension** (Vue 3).
+A powerful Text-to-Speech solution with multi-engine support. Consists of a **Python Backend** (FastAPI), a **Chrome Extension** (Vue 3), and an **OpenAI-compatible API**.
 
 ## Features
 
-- 🚀 **High Quality**: Uses Microsoft Edge's natural sounding Neural voices.
-- ⚡ **Streaming**: Low latency audio streaming.
-- 🧩 **Smart Chunking**: Automatically splits long articles into paragraphs.
-- 🔁 **Preloading**: Automatically fetches the next paragraph for smooth playback.
-- ⏯️ **Controls**: Play, Pause, Resume, Stop, Click-to-play, Retry failed chunks.
-- ⚙️ **Customizable**: Adjust speed (-50% to +50%) and switch voices.
-- 🔒 **Secure**: JWT authentication with localhost bypass and persistent secret keys.
+- 🚀 **Multi-Engine**: Microsoft Edge Neural voices + Volcengine (ByteDance) TTS
+- 🤖 **OpenAI Compatible**: Drop-in replacement for `POST /v1/audio/speech` — works with OpenAI SDK
+- ⚡ **Streaming**: Low latency audio streaming
+- 🧩 **Smart Chunking**: Automatically splits long articles into paragraphs
+- 🔁 **Preloading**: Automatically fetches the next paragraph for smooth playback
+- ⏯️ **Controls**: Play, Pause, Resume, Stop, Click-to-play, Retry failed chunks
+- ⚙️ **Customizable**: Adjust speed, volume, voice, format
+- 🔒 **Secure**: JWT authentication with localhost bypass
+
+## API Endpoints
+
+### OpenAI Compatible (Recommended)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/audio/speech` | TTS synthesis (model=`tts-1` for Edge, `volcengine` for Volcengine) |
+| GET | `/v1/models` | List available models |
+| GET | `/v1/audio/voices` | List all voices across engines |
+
+```python
+from openai import OpenAI
+
+client = OpenAI(api_key="dummy", base_url="http://localhost:8000/v1")
+
+# Edge engine
+response = client.audio.speech.create(model="tts-1", voice="zh-CN-XiaoxiaoNeural", input="Hello")
+
+# Volcengine engine
+response = client.audio.speech.create(model="volcengine", voice="alloy", input="你好")
+```
+
+### Legacy (Backward Compatible)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/v1/tts/stream` | Original TTS endpoint |
+| GET | `/api/v1/tts/voices` | Voice list |
+| POST | `/api/v1/text/chunk` | Text chunking |
 
 ## Authentication & Security
 
@@ -87,17 +118,58 @@ A powerful Text-to-Speech solution using Microsoft Edge's online TTS engine. It 
 <a name="chinese"></a>
 # Edge TTS (浏览器插件与服务端)
 
-一个基于微软 Edge 在线语音引擎的强大文本转语音解决方案。包含一个 **Python 后端** (FastAPI) 和一个 **Chrome 插件** (Vue 3)。
+一个多引擎文本转语音解决方案。包含 **Python 后端** (FastAPI)、**Chrome 插件** (Vue 3) 和 **OpenAI 兼容 API**。
 
 ## 功能特性
 
-- 🚀 **高质量语音**: 使用微软 Edge 的自然神经网络语音 (如 `zh-CN-XiaoxiaoNeural`)。
-- ⚡ **流式传输**: 极低延迟的音频流式播放。
-- 🧩 **智能分块**: 自动将长文章切分为段落，支持逐段播放。
-- 🔁 **自动预加载**: 播放当前段落时自动下载下一段，实现无缝衔接。
-- ⏯️ **播放控制**: 支持 播放、暂停、恢复、停止，点击跳转，失败重试。
-- ⚙️ **个性化设置**: 支持语速调节 (-50% 到 +50%) 和语音切换。
-- 🔒 **安全保护**: 内置 JWT 鉴权机制，支持本地回环免密访问及密钥持久化。
+- 🚀 **多引擎**: 微软 Edge Neural 语音 + 火山引擎（字节跳动）TTS
+- 🤖 **OpenAI 兼容**: 可直接用 OpenAI SDK 调用 (`POST /v1/audio/speech`)
+- ⚡ **流式传输**: 极低延迟的音频流式播放
+- 🧩 **智能分块**: 自动将长文章切分为段落，支持逐段播放
+- 🔁 **自动预加载**: 播放当前段落时自动下载下一段，实现无缝衔接
+- ⏯️ **播放控制**: 播放、暂停、恢复、停止，点击跳转，失败重试
+- ⚙️ **个性化**: 语速、音量、音色、格式可调
+- 🔒 **安全**: JWT 鉴权 + 本地免密
+
+## API 端点
+
+### OpenAI 兼容接口（推荐）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/v1/audio/speech` | TTS 合成 (model=`tts-1` 用 Edge, `volcengine` 用火山引擎) |
+| GET | `/v1/models` | 模型列表 |
+| GET | `/v1/audio/voices` | 所有引擎音色列表 |
+
+```python
+from openai import OpenAI
+
+client = OpenAI(api_key="dummy", base_url="http://localhost:8000/v1")
+
+# Edge 引擎
+response = client.audio.speech.create(model="tts-1", voice="zh-CN-XiaoxiaoNeural", input="你好")
+
+# 火山引擎
+response = client.audio.speech.create(model="volcengine", voice="alloy", input="你好")
+```
+
+### 原有接口（向后兼容）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/v1/tts/stream` | 原有 TTS 接口 |
+| GET | `/api/v1/tts/voices` | 音色列表 |
+| POST | `/api/v1/text/chunk` | 文本分块 |
+
+## CLI 工具
+
+```bash
+# 直接合成 Markdown 文件
+python tts_demo.py document.md --output output.mp3
+
+# 指定引擎参数
+python tts_demo.py doc.md --voice zh_female_vv_uranus_bigtts --speech-rate 20
+```
 
 ## 认证与安全说明
 
