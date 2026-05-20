@@ -24,12 +24,13 @@
       </div>
       <div class="form-group">
         <label>Speed:</label>
-        <select v-model="selectedRate" @change="saveSettings">
-          <option value="-50%">-50% (Slow)</option>
-          <option value="-25%">-25%</option>
-          <option value="+0%">Normal</option>
-          <option value="+25%">+25%</option>
-          <option value="+50%">+50% (Fast)</option>
+        <select v-model="selectedSpeed" @change="saveSettings">
+          <option :value="0.5">0.50x (Slow)</option>
+          <option :value="0.75">0.75x</option>
+          <option :value="1.0">1.00x (Normal)</option>
+          <option :value="1.2">1.20x</option>
+          <option :value="1.5">1.50x (Fast)</option>
+          <option :value="2.0">2.00x (Faster)</option>
         </select>
       </div>
       <div class="form-group">
@@ -120,7 +121,7 @@ const showSettings = ref(false);
 const backendUrl = ref('http://localhost:8000');
 const jwtToken = ref('');
 const selectedVoice = ref('zh-CN-XiaoxiaoNeural');
-const selectedRate = ref('+0%');
+const selectedSpeed = ref(1.0);
 const preloadCount = ref(3);
 const voiceList = ref<Voice[]>([]);
 const isLoadingVoices = ref(false);
@@ -149,11 +150,11 @@ onMounted(async () => {
 });
 
 async function loadSettings() {
-  const result = await chrome.storage.local.get(['backendUrl', 'jwtToken', 'voice', 'rate', 'voiceList', 'preloadCount']);
+  const result = await chrome.storage.local.get(['backendUrl', 'jwtToken', 'voice', 'speed', 'voiceList', 'preloadCount']);
   if (result.backendUrl) backendUrl.value = result.backendUrl;
   if (result.jwtToken) jwtToken.value = result.jwtToken;
   if (result.voice) selectedVoice.value = result.voice;
-  if (result.rate) selectedRate.value = result.rate;
+  if (result.speed) selectedSpeed.value = result.speed;
   if (result.preloadCount) preloadCount.value = Math.max(1, Math.min(10, result.preloadCount));
   if (result.voiceList) voiceList.value = result.voiceList;
 }
@@ -164,7 +165,7 @@ async function saveSettings() {
     backendUrl: backendUrl.value,
     jwtToken: jwtToken.value,
     voice: selectedVoice.value,
-    rate: selectedRate.value,
+    speed: selectedSpeed.value,
     preloadCount: preloadCount.value,
     voiceList: voiceList.value
   });
@@ -172,7 +173,7 @@ async function saveSettings() {
 
 function getApiUrl(path: string) {
     const base = backendUrl.value.replace(/\/$/, '');
-    return `${base}/api/v1${path}`;
+    return `${base}${path}`;
 }
 
 function getHeaders() {
@@ -188,7 +189,7 @@ function getHeaders() {
 async function fetchVoices() {
     isLoadingVoices.value = true;
     try {
-        const res = await fetch(getApiUrl('/tts/voices?engine=edge'), {
+        const res = await fetch(getApiUrl('/v1/audio/voices'), {
             headers: getHeaders()
         });
         
@@ -199,8 +200,8 @@ async function fetchVoices() {
         }
         
         if (!res.ok) throw new Error("Failed to fetch voices");
-        const data = await res.json();
-        voiceList.value = data;
+        const body = await res.json();
+        voiceList.value = body.data || [];
         saveSettings(); 
     } catch (e: any) {
         error.value = "Voice fetch failed: " + e.message;
@@ -245,7 +246,7 @@ async function readPage() {
     }
 
     status.value = 'Chunking text...';
-    const chunkRes = await fetch(getApiUrl('/text/chunk'), {
+    const chunkRes = await fetch(`${backendUrl.value.replace(/\/$/, '')}/api/v1/text/chunk`, {
       method: 'POST',
       headers: getHeaders(),
       body: JSON.stringify({ text })
@@ -278,14 +279,19 @@ async function readPage() {
 }
 
 async function fetchAudioBlob(text: string): Promise<string> {
-    const response = await fetch(getApiUrl('/tts/stream'), {
+    const voiceId = selectedVoice.value;
+    // Route: Edge voices → tts-1, Volcengine voices → volcengine
+    const voiceInfo = voiceList.value.find(v => v.id === voiceId);
+    const model = (voiceInfo && voiceInfo.engine === 'volcengine') ? 'volcengine' : 'tts-1';
+
+    const response = await fetch(getApiUrl('/v1/audio/speech'), {
         method: 'POST',
         headers: getHeaders(),
         body: JSON.stringify({
-            text: text,
-            engine: 'edge',
-            voice: selectedVoice.value,
-            rate: selectedRate.value
+            model: model,
+            input: text,
+            voice: voiceId,
+            speed: selectedSpeed.value
         })
     });
 

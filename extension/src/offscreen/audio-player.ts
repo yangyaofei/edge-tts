@@ -96,14 +96,20 @@ async function fetchAndPlay(data: any) {
     }
 
     try {
+        const result = await chrome.storage.local.get(['backendUrl', 'voice', 'speed']);
+        const baseUrl = result.backendUrl || 'http://localhost:8000';
+        const voice = result.voice || 'zh-CN-XiaoxiaoNeural';
+        const speed = result.speed || 1.0;
+
         console.log("Offscreen: Fetching audio from backend...");
-        // Use the unified endpoint
-        const response = await fetch('http://localhost:8000/api/v1/tts/stream', {
+        const response = await fetch(`${baseUrl.replace(/\/$/, '')}/v1/audio/speech`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                ...data,
-                engine: 'edge' // Explicitly select the engine
+                model: 'tts-1',
+                input: data.text || data,
+                voice: voice,
+                speed: speed
             })
         });
 
