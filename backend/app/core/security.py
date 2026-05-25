@@ -1,9 +1,12 @@
 from datetime import datetime, timedelta
 from typing import Optional
+import logging
 import jwt
 from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 # Make auto_error=False to allow checking IP first
 security = HTTPBearer(auto_error=False)
@@ -21,14 +24,9 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     return encoded_jwt
 
 def verify_token(request: Request, token_auth: Optional[HTTPAuthorizationCredentials] = Depends(security)):
-    # 1. Bypass for Localhost
-    client_host = request.client.host
-    if client_host == "127.0.0.1" or client_host == "::1":
-        # print(f"DEBUG: Bypassing auth for localhost: {client_host}")
-        return {"sub": "localhost", "admin": True}
-
-    # 2. Check Token
+    # Check Token
     if not token_auth:
+        logger.warning(f"verify_token: no token provided, client={request.client.host}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Not authenticated",
@@ -36,6 +34,7 @@ def verify_token(request: Request, token_auth: Optional[HTTPAuthorizationCredent
         )
 
     token = token_auth.credentials
+    logger.info(f"verify_token: client={request.client.host} token={token}")
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
         return payload

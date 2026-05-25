@@ -1,3 +1,13 @@
+import logging
+import sys
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)-8s %(name)s  %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("app")
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
@@ -7,6 +17,13 @@ app = FastAPI(
     title=settings.PROJECT_NAME,
     openapi_url=f"{settings.API_V1_STR}/openapi.json"
 )
+
+@app.middleware("http")
+async def log_requests(request, call_next):
+    logger.info(f">>> {request.method} {request.url.path} client={request.client}")
+    response = await call_next(request)
+    logger.info(f"<<< {request.method} {request.url.path} status={response.status_code}")
+    return response
 
 # Set all CORS enabled origins
 if settings.BACKEND_CORS_ORIGINS:
