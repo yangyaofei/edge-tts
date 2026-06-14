@@ -54,16 +54,16 @@ class Qwen3TTSEngine:
         speed: float = 1.0,
         ref_audio: bytes | None = None,
     ) -> AsyncGenerator[bytes, None]:
-        """流式接收音频：server 边生成边返回，client 边收边 yield。
+        """流式接收音频：server 按句子切分，边生成边返回。
 
-        需要 server 支持 chunked transfer encoding。
+        首字延迟从"整段生成完"降到"首句生成完"。
         """
         payload = self._build_payload(text, ref_audio)
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             async with client.stream(
                 "POST",
-                f"{self.server_url}/api/synthesize",
+                f"{self.server_url}/api/synthesize_stream",
                 json=payload,
             ) as resp:
                 resp.raise_for_status()

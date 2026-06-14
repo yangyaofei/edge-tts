@@ -376,6 +376,241 @@ int main(int argc, char ** argv) {
             res.set_content(wav_bytes, "audio/wav");
         });
 
+    // =========================================================================
+    // POST /api/synthesize_stream — sentence-level streaming
+    //
+    // Splits text by sentence endings (。！？!?), synthesizes each sentence
+    // sequentially, and streams WAV audio via chunked transfer encoding.
+    //
+    // The client receives audio progressively: first sentence's audio arrives
+    // while subsequent sentences are still being generated.
+    //
+    // Response format: WAV with data_size=0xFFFFFFFF (streaming), followed by
+    // raw int16 PCM mono 24kHz. Most WAV players read until EOF.
+    // =========================================================================
+    svr.Post("/api/synthesize_stream",
+        [&](const httplib::Request & req, httplib::Response & res) {
+            // -- Parse JSON body --
+            json body;
+            try {
+                body = json::parse(req.body);
+            } catch (const std::exception & e) {
+                res.status = 400;
+                json err;
+                err["error"] = std::string("Invalid JSON: ") + e.what();
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+
+            if (!body.contains("text") || !body["text"].is_string()) {
+                res.status = 400;
+                json err;
+                err["error"] = "Missing required field: 'text' (string)";
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+            std::string text = body["text"].get<std::string>();
+            if (text.empty()) {
+                res.status = 400;
+                json err;
+                err["error"] = "'text' must not be empty";
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+
+            // -- Build params --
+            qwen3_tts::tts_params params;
+            params.n_threads    = n_threads;
+            params.print_timing = false;
+
+            if (body.contains("language") && body["language"].is_string()) {
+                params.language_id = language_to_id(body["language"].get<std::string>());
+            }
+            if (body.contains("max_tokens") && body["max_tokens"].is_number()) {
+                params.max_audio_tokens = body["max_tokens"].get<int32_t>();
+            }
+            if (body.contains("temperature") && body["temperature"].is_number()) {
+                params.temperature = body["temperature"].get<float>();
+            }
+            if (body.contains("top_k") && body["top_k"].is_number()) {
+                params.top_k = body["top_k"].get<int32_t>();
+            }
+            if (body.contains("top_p") && body["top_p"].is_number()) {
+                params.top_p = body["top_p"].get<float>();
+            }
+            if (body.contains("repetition_penalty") && body["repetition_penalty"].is_number()) {
+                params.repetition_penalty = body["repetition_penalty"].get<float>();
+            }
+
+            // -- Handle optional ref_audio --
+            std::string ref_temp_path;
+            bool has_ref = false;
+
+            if (body.contains("ref_audio") && body["ref_audio"].is_string()) {
+                const std::string & b64 = body["ref_audio"].get<std::string>();
+                if (!b64.empty()) {
+                    auto decoded = base64_decode(b64);
+                    if (!decoded.empty()) {
+                        ref_temp_path = make_temp_path(".wav");
+                        if (write_file_bytes(ref_temp_path, decoded.data(), decoded.size())) {
+                            has_ref = true;
+                        }
+                    }
+                }
+            }
+
+            // -- Split text into sentences --
+            std::vector<std::string> sentences;
+            {
+                std::string current;
+                for (size_t i = 0; i < text.size(); ++i) {
+                    current += text[i];
+                    char c = text[i];
+                    if (c == '\xe3') {
+                        // Possible multi-byte Chinese punctuation
+                        // 。= \xe3\x80\x82  ！= \xef\xbc\x81  ？= \xef\xbc\x9f
+                        if (i + 2 < text.size() &&
+                            ((text[i+1] == '\x80' && text[i+2] == '\x82') ||
+                             (text[i+1] == '\x80' && text[i+2] == '\x8b'))) {
+                            sentences.push_back(current);
+                            current.clear();
+                        }
+                    }
+                    if (c == '\xef' && i + 2 < text.size()) {
+                        if ((text[i+1] == '\xbc' && text[i+2] == '\x81') ||  // ！
+                            (text[i+1] == '\xbc' && text[i+2] == '\x9f')) {   // ？
+                            sentences.push_back(current);
+                            current.clear();
+                        }
+                    }
+                    if (c == '\n' || c == '.' || c == '!' || c == '?') {
+                        std::string trimmed = current;
+                        // trim trailing whitespace
+                        while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\n')) {
+                            trimmed.pop_back();
+                        }
+                        if (!trimmed.empty()) {
+                            sentences.push_back(trimmed);
+                        }
+                        current.clear();
+                    }
+                }
+                // Last segment
+                while (!current.empty() && (current.back() == ' ' || current.back() == '\n')) {
+                    current.pop_back();
+                }
+                if (!current.empty()) {
+                    sentences.push_back(current);
+                }
+            }
+
+            if (sentences.empty()) {
+                sentences.push_back(text);
+            }
+
+            fprintf(stderr, "\n[req] synthesize_stream: %zu sentences, ref=%s\n",
+                    sentences.size(), has_ref ? "yes" : "no");
+
+            // -- Streaming state --
+            struct StreamState {
+                size_t index = 0;
+                bool header_sent = false;
+                int32_t sample_rate = 24000;
+            };
+            auto state = std::make_shared<StreamState>();
+
+            // -- Set up chunked streaming response --
+            res.set_chunked_content_provider(
+                "audio/wav",
+                [&, state, sentences, params, has_ref, ref_temp_path]
+                (size_t offset, httplib::DataSink & sink) -> bool {
+
+                    // Send WAV header (first call only)
+                    if (!state->header_sent) {
+                        state->header_sent = true;
+
+                        // WAV header: PCM, mono, 16-bit, streaming (size=0xFFFFFFFF)
+                        struct __attribute__((packed)) WAVHeader {
+                            char     riff[4]     = {'R','I','F','F'};
+                            uint32_t riff_size   = 0xFFFFFFFF;
+                            char     wave[4]     = {'W','A','V','E'};
+                            char     fmt_[4]     = {'f','m','t',' '};
+                            uint32_t fmt_size    = 16;
+                            uint16_t audio_fmt   = 1;       // PCM
+                            uint16_t channels    = 1;       // mono
+                            uint32_t sample_rate = 24000;
+                            uint32_t byte_rate   = 48000;   // sr * channels * 2
+                            uint16_t block_align = 2;       // channels * 2
+                            uint16_t bits         = 16;
+                            char     data[4]     = {'d','a','t','a'};
+                            uint32_t data_size   = 0xFFFFFFFF;
+                        } header;
+
+                        sink.write(reinterpret_cast<const char *>(&header), sizeof(header));
+                        fprintf(stderr, "  [stream] WAV header sent (%zu bytes)\n", sizeof(header));
+                    }
+
+                    // All sentences done?
+                    if (state->index >= sentences.size()) {
+                        sink.done();
+                        fprintf(stderr, "  [stream] done (%zu sentences)\n", sentences.size());
+                        return true;
+                    }
+
+                    // Synthesize current sentence
+                    const std::string & sentence = sentences[state->index];
+                    fprintf(stderr, "  [stream] sentence %zu/%zu: \"%s\"\n",
+                            state->index + 1, sentences.size(),
+                            sentence.substr(0, 60).c_str());
+
+                    qwen3_tts::tts_result result;
+                    {
+                        std::lock_guard<std::mutex> lock(tts_mutex);
+                        if (has_ref) {
+                            result = tts.synthesize_with_voice(sentence, ref_temp_path, params);
+                        } else {
+                            result = tts.synthesize(sentence, params);
+                        }
+                    }
+
+                    state->index++;
+
+                    if (!result.success) {
+                        fprintf(stderr, "  [stream] sentence %zu failed: %s\n",
+                                state->index, result.error_msg.c_str());
+                        // Continue to next sentence instead of aborting
+                        return true;
+                    }
+
+                    // Convert float samples to int16 and write to sink
+                    const size_t n_samples = result.audio.size();
+                    std::vector<int16_t> pcm16(n_samples);
+                    for (size_t i = 0; i < n_samples; ++i) {
+                        float s = result.audio[i];
+                        if (s > 1.0f) s = 1.0f;
+                        if (s < -1.0f) s = -1.0f;
+                        pcm16[i] = static_cast<int16_t>(s * 32767.0f);
+                    }
+
+                    sink.write(reinterpret_cast<const char *>(pcm16.data()),
+                               pcm16.size() * sizeof(int16_t));
+
+                    fprintf(stderr, "  [stream] sentence %zu: %zu samples (%.2fs)\n",
+                            state->index, n_samples,
+                            (double) n_samples / result.sample_rate);
+
+                    return true;  // continue to next sentence
+                },
+                // Cleanup callback
+                [ref_temp_path](bool success) {
+                    if (!ref_temp_path.empty()) {
+                        std::error_code ec;
+                        std::filesystem::remove(ref_temp_path, ec);
+                    }
+                }
+            );
+        });
+
     // ---- Graceful shutdown logging ----
     svr.set_logger([](const httplib::Request & req, const httplib::Response & res) {
         fprintf(stderr, "[%d] %s %s\n", res.status, req.method.c_str(), req.path.c_str());
@@ -385,6 +620,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "\nListening on http://%s:%d\n", host.c_str(), port);
     fprintf(stderr, "  GET  /api/health\n");
     fprintf(stderr, "  POST /api/synthesize\n");
+    fprintf(stderr, "  POST /api/synthesize_stream\n");
 
     if (!svr.listen(host.c_str(), port)) {
         fprintf(stderr, "Error: failed to listen on %s:%d\n", host.c_str(), port);

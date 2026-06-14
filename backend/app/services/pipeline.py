@@ -95,22 +95,38 @@ class TTSPipeline:
 
             logger.debug(f"Pipeline chunk {i}/{len(chunks)}: {len(chunk_text)} chars")
 
-            audio = await self.engine.generate_chunk(
-                chunk_text,
-                voice=voice,
-                speed=speed,
-                ref_audio=ref_audio,
-            )
-
-            # 首段提取参考音频（用于后续段声音克隆）
-            if first_chunk and len(chunks) > 1:
-                ref_audio = self._extract_ref(audio, self.ref_trim_seconds)
-
-            # 段间插入静音
-            if not first_chunk and self.silence_between_chunks > 0:
-                yield self._make_silence(audio, self.silence_between_chunks)
+            # 对 qwen engine 使用流式接口（server 内部按句子流式）
+            if hasattr(self.engine, 'generate_chunk_stream'):
+                # 流式：直接 yield 每个数据块，首字延迟最低
+                if first_chunk:
+                    # 首段收集完整音频用于提取 ref
+                    audio_parts: list[bytes] = []
+                    async for data in self.engine.generate_chunk_stream(
+                        chunk_text, voice=voice, speed=speed, ref_audio=ref_audio,
+                    ):
+                        audio_parts.append(data)
+                        yield data
+                    first_chunk_audio = b"".join(audio_parts)
+                    if len(chunks) > 1:
+                        ref_audio = self._extract_ref(first_chunk_audio, self.ref_trim_seconds)
+                else:
+                    if self.silence_between_chunks > 0:
+                        yield self._make_silence_from_engine(ref_audio, self.silence_between_chunks)
+                    async for data in self.engine.generate_chunk_stream(
+                        chunk_text, voice=voice, speed=speed, ref_audio=ref_audio,
+                    ):
+                        yield data
             else:
-                yield audio
+                # 非流式 engine（edge/volcengine）：等完整音频
+                audio = await self.engine.generate_chunk(
+                    chunk_text, voice=voice, speed=speed, ref_audio=ref_audio,
+                )
+                if first_chunk and len(chunks) > 1:
+                    ref_audio = self._extract_ref(audio, self.ref_trim_seconds)
+                if not first_chunk and self.silence_between_chunks > 0:
+                    yield self._make_silence(audio, self.silence_between_chunks)
+                else:
+                    yield audio
 
             first_chunk = False
 
@@ -166,3 +182,11 @@ class TTSPipeline:
             return out_buf.getvalue()
         except Exception:
             return b""
+
+    def _make_silence_from_engine(self, ref_wav: bytes | None, seconds: float) -> bytes:
+        """从引擎格式信息生成静音 PCM（用于流式模式）。"""
+        if ref_wav:
+            return self._make_silence(ref_wav, seconds)
+        # 默认格式：16-bit PCM mono 24kHz
+        n_samples = int(seconds * self.sample_rate)
+        return b"\x00" * (n_samples * 2)  # int16 = 2 bytes/sample
