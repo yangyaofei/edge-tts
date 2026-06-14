@@ -14,11 +14,13 @@ class TextChunkResponse(BaseModel):
     chunks: List[Chunk]
 
 
-class EdgeTTSRequest(BaseModel):
+class TTSRequest(BaseModel):
     text: str
+    engine: str = "edge"
     voice: str = "zh-CN-XiaoxiaoNeural"
-    rate: str = "+0%"
-    pitch: str = "+0Hz"
+    speed: float = 1.0
+    preprocess: bool = True
+    language: str = "zh"
 
 
 class VoiceInfo(BaseModel):

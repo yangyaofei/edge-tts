@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import io
@@ -6,7 +8,7 @@ import logging
 import struct
 import uuid
 from enum import IntEnum
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
 
 import websockets
 
@@ -51,6 +53,12 @@ WS_TEXT_THRESHOLD = 800
 
 
 class VolcengineTTSEngine:
+    """Volcengine (ByteDance) Seed-TTS engine。
+
+    通过 generate_chunk 实现 TTSEngine Protocol。
+    ref_audio 参数被忽略。
+    """
+
     def __init__(self, api_key: str = "", app_id: str = "", access_token: str = ""):
         self.api_key = api_key
         self.app_id = app_id
@@ -64,8 +72,26 @@ class VolcengineTTSEngine:
     def get_openai_voices() -> list:
         return OPENAI_VOICES
 
+    async def generate_chunk(
+        self,
+        text: str,
+        voice: str = "alloy",
+        speed: float = 1.0,
+        ref_audio: bytes | None = None,
+        audio_format: str = "mp3",
+    ) -> bytes:
+        voice_id = self.resolve_voice(voice)
+        chunks: list[bytes] = []
+        async for chunk in self.generate_stream(text, voice_id, speed, audio_format):
+            chunks.append(chunk)
+        return b"".join(chunks)
+
     async def generate_stream(
-        self, text: str, voice: str, speed: float = 1.0, audio_format: str = "mp3",
+        self,
+        text: str,
+        voice: str,
+        speed: float = 1.0,
+        audio_format: str = "mp3",
     ) -> AsyncGenerator[bytes, None]:
         if len(text) <= WS_TEXT_THRESHOLD:
             async for chunk in self._http_stream(text, voice, speed, audio_format):
@@ -209,6 +235,9 @@ class VolcengineTTSEngine:
             except Exception:
                 pass
             await ws.close()
+
+    async def get_voices(self) -> list[dict[str, Any]]:
+        return OPENAI_VOICES
 
 
 class MsgType(IntEnum):

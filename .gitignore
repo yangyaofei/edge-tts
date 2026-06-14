@@ -33,3 +33,10 @@ config/
 # Temporary
 *.log
 tmp/
+
+# Research (large files, models, audio samples)
+research/
+
+# Vendored header-only libs (downloaded in Dockerfile)
+docker/qwen3-tts-server/httplib.h
+docker/qwen3-tts-server/json.hpp

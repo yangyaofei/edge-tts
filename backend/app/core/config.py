@@ -67,6 +67,19 @@ class Settings(BaseSettings):
     VOLCENGINE_APP_ID: str = ""
     VOLCENGINE_ACCESS_TOKEN: str = ""
 
+    # Qwen3-TTS Server
+    QWEN3_TTS_SERVER_URL: str = "http://localhost:9880"
+    QWEN3_TTS_LANGUAGE: str = "zh"
+    QWEN3_TTS_MAX_TOKENS: int = 8192
+    QWEN3_TTS_REF_TRIM_SECONDS: int = 8
+
+    # Pipeline 通用配置
+    TTS_PREPROCESS_ENABLED: bool = True
+    TTS_POLYPHONE_FIX_ENABLED: bool = True
+    TTS_CHUNK_STRATEGY: str = "paragraph"
+    TTS_CHUNK_MAX_CHARS: int = 500
+    TTS_SILENCE_BETWEEN_CHUNKS: float = 0.3
+
     class Config:
         case_sensitive = True
 
