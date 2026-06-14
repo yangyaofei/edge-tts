@@ -13,6 +13,7 @@ from app.services.pipeline import TTSPipeline
 from app.services.text_preprocessor import TextPreprocessor
 from app.services.polyphone import PolyphoneFixer
 from app.services.chunker import TextChunker
+from app.services.llm_transcriber import LLMTranscriber
 from app.core.security import verify_token
 from app.core.config import settings
 
@@ -59,13 +60,24 @@ def _engine_kwargs(engine_name: str) -> dict:
 
 def _build_pipeline(engine_name: str) -> TTSPipeline:
     engine = EngineRegistry.create(engine_name, **_engine_kwargs(engine_name))
+
+    llm_transcriber = None
+    if settings.TTS_LLM_TRANSCRIBE_ENABLED:
+        llm_transcriber = LLMTranscriber(
+            api_url=settings.TTS_LLM_TRANSCRIBE_API_URL,
+            api_key=settings.TTS_LLM_TRANSCRIBE_API_KEY,
+            model=settings.TTS_LLM_TRANSCRIBE_MODEL,
+        )
+
     return TTSPipeline(
         engine=engine,
+        llm_transcriber=llm_transcriber,
         preprocessor=TextPreprocessor() if settings.TTS_PREPROCESS_ENABLED else None,
         polyphone_fixer=PolyphoneFixer() if settings.TTS_POLYPHONE_FIX_ENABLED else None,
         chunker=TextChunker(),
         ref_trim_seconds=settings.QWEN3_TTS_REF_TRIM_SECONDS,
         silence_between_chunks=settings.TTS_SILENCE_BETWEEN_CHUNKS,
+        first_chunk_minimize=settings.TTS_FIRST_CHUNK_MINIMIZE,
     )
 
 

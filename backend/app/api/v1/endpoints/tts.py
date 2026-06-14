@@ -13,6 +13,7 @@ from app.services.pipeline import TTSPipeline
 from app.services.text_preprocessor import TextPreprocessor
 from app.services.polyphone import PolyphoneFixer
 from app.services.chunker import TextChunker
+from app.services.llm_transcriber import LLMTranscriber
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -45,15 +46,25 @@ def _build_pipeline(engine_name: str, preprocess: bool = True) -> TTSPipeline:
     polyphone_fixer = PolyphoneFixer() if (preprocess and settings.TTS_POLYPHONE_FIX_ENABLED) else None
     chunker = TextChunker()
 
+    llm_transcriber = None
+    if preprocess and settings.TTS_LLM_TRANSCRIBE_ENABLED:
+        llm_transcriber = LLMTranscriber(
+            api_url=settings.TTS_LLM_TRANSCRIBE_API_URL,
+            api_key=settings.TTS_LLM_TRANSCRIBE_API_KEY,
+            model=settings.TTS_LLM_TRANSCRIBE_MODEL,
+        )
+
     ref_trim = settings.QWEN3_TTS_REF_TRIM_SECONDS if engine_name == "qwen" else 8
 
     return TTSPipeline(
         engine=engine,
+        llm_transcriber=llm_transcriber,
         preprocessor=preprocessor,
         polyphone_fixer=polyphone_fixer,
         chunker=chunker,
         ref_trim_seconds=ref_trim,
         silence_between_chunks=settings.TTS_SILENCE_BETWEEN_CHUNKS,
+        first_chunk_minimize=settings.TTS_FIRST_CHUNK_MINIMIZE,
     )
 
 

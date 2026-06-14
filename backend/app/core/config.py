@@ -79,6 +79,13 @@ class Settings(BaseSettings):
     TTS_CHUNK_STRATEGY: str = "paragraph"
     TTS_CHUNK_MAX_CHARS: int = 500
     TTS_SILENCE_BETWEEN_CHUNKS: float = 0.3
+    TTS_FIRST_CHUNK_MINIMIZE: bool = True  # 首段最小化（单句）降低首字延迟
+
+    # LLM 转写（可选前置步骤）
+    TTS_LLM_TRANSCRIBE_ENABLED: bool = False
+    TTS_LLM_TRANSCRIBE_API_URL: str = ""        # OpenAI-compatible endpoint
+    TTS_LLM_TRANSCRIBE_API_KEY: str = ""
+    TTS_LLM_TRANSCRIBE_MODEL: str = "gpt-4o-mini"
 
     class Config:
         case_sensitive = True
