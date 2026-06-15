@@ -611,6 +611,224 @@ int main(int argc, char ** argv) {
             );
         });
 
+    // =========================================================================
+    // POST /api/synthesize_frame_stream — frame-level streaming
+    //
+    // Uses Qwen3TTS::synthesize_streaming() which decodes codec tokens in
+    // overlapping chunks during the autoregressive generation loop.
+    //
+    // Benefits over sentence-level streaming:
+    //   - Single generation pass → consistent voice and prosody
+    //   - PCM is emitted every ~30 frames (~2.4s) during generation
+    //
+    // Response: WAV (streaming, data_size=0xFFFFFFFF) with int16 PCM
+    // =========================================================================
+    svr.Post("/api/synthesize_frame_stream",
+        [&](const httplib::Request & req, httplib::Response & res) {
+            // Parse JSON body
+            json body;
+            try {
+                body = json::parse(req.body);
+            } catch (const std::exception & e) {
+                res.status = 400;
+                json err;
+                err["error"] = std::string("Invalid JSON: ") + e.what();
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+
+            if (!body.contains("text") || !body["text"].is_string()) {
+                res.status = 400;
+                json err;
+                err["error"] = "Missing required field: 'text'";
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+            std::string text = body["text"].get<std::string>();
+            if (text.empty()) {
+                res.status = 400;
+                json err;
+                err["error"] = "'text' must not be empty";
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+
+            // Build params
+            qwen3_tts::tts_params params;
+            params.n_threads    = n_threads;
+            params.print_timing = false;
+
+            if (body.contains("language") && body["language"].is_string())
+                params.language_id = language_to_id(body["language"].get<std::string>());
+            if (body.contains("max_tokens") && body["max_tokens"].is_number())
+                params.max_audio_tokens = body["max_tokens"].get<int32_t>();
+            if (body.contains("temperature") && body["temperature"].is_number())
+                params.temperature = body["temperature"].get<float>();
+            if (body.contains("top_k") && body["top_k"].is_number())
+                params.top_k = body["top_k"].get<int32_t>();
+
+            int32_t chunk_frames = 30;
+            int32_t overlap_frames = 10;
+            if (body.contains("chunk_frames") && body["chunk_frames"].is_number())
+                chunk_frames = body["chunk_frames"].get<int32_t>();
+            if (body.contains("overlap_frames") && body["overlap_frames"].is_number())
+                overlap_frames = body["overlap_frames"].get<int32_t>();
+
+            // Handle optional ref_audio
+            std::string ref_temp_path;
+            bool has_ref = false;
+
+            if (body.contains("ref_audio") && body["ref_audio"].is_string()) {
+                const std::string & b64 = body["ref_audio"].get<std::string>();
+                if (!b64.empty()) {
+                    auto decoded = base64_decode(b64);
+                    if (!decoded.empty()) {
+                        ref_temp_path = make_temp_path(".wav");
+                        if (write_file_bytes(ref_temp_path, decoded.data(), decoded.size())) {
+                            has_ref = true;
+                        }
+                    }
+                }
+            }
+
+            fprintf(stderr, "\n[req] synthesize_frame_stream: chunk=%d overlap=%d ref=%s\n",
+                    chunk_frames, overlap_frames, has_ref ? "yes" : "no");
+
+            // Shared state between synthesis thread and provider callback
+            struct StreamState {
+                std::mutex mutex;
+                std::condition_variable cv;
+                std::vector<int16_t> buffer;  // PCM ready to send
+                bool done = false;
+                bool header_sent = false;
+                size_t total_samples = 0;
+            };
+            auto state = std::make_shared<StreamState>();
+
+            // Audio callback: called from synthesis thread, buffers PCM
+            auto audio_cb = [state](const float * samples, int32_t n_samples) -> bool {
+                std::vector<int16_t> pcm16(n_samples);
+                for (int32_t i = 0; i < n_samples; ++i) {
+                    float s = samples[i];
+                    if (s > 1.0f) s = 1.0f;
+                    if (s < -1.0f) s = -1.0f;
+                    pcm16[i] = static_cast<int16_t>(s * 32767.0f);
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->buffer.insert(state->buffer.end(), pcm16.begin(), pcm16.end());
+                    state->total_samples += n_samples;
+                }
+                state->cv.notify_one();
+
+                fprintf(stderr, "  [frame-stream] chunk: %d samples (total: %zu)\n",
+                        n_samples, state->total_samples);
+                return true;
+            };
+
+            // Start synthesis in a separate thread
+            std::thread synth_thread([&tts, &tts_mutex, text, params, has_ref, ref_temp_path,
+                                       audio_cb, state, chunk_frames, overlap_frames]() {
+                fprintf(stderr, "  [frame-stream] synthesis thread started\n");
+
+                qwen3_tts::tts_result result;
+                {
+                    std::lock_guard<std::mutex> lock(tts_mutex);
+                    if (has_ref) {
+                        result = tts.synthesize_streaming_with_voice(
+                            text, ref_temp_path, params, audio_cb,
+                            chunk_frames, overlap_frames);
+                    } else {
+                        result = tts.synthesize_streaming(
+                            text, params, audio_cb,
+                            chunk_frames, overlap_frames);
+                    }
+                }
+
+                if (!ref_temp_path.empty()) {
+                    std::error_code ec;
+                    std::filesystem::remove(ref_temp_path, ec);
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->done = true;
+                }
+                state->cv.notify_one();
+
+                if (result.success) {
+                    fprintf(stderr, "  [frame-stream] synthesis done: %.2fs audio\n",
+                            (double)result.audio.size() / result.sample_rate);
+                } else {
+                    fprintf(stderr, "  [frame-stream] synthesis failed: %s\n",
+                            result.error_msg.c_str());
+                }
+            });
+            synth_thread.detach();  // fire and forget — state keeps it alive
+
+            // Streaming response: drain buffer as PCM arrives
+            res.set_chunked_content_provider(
+                "audio/wav",
+                [state](size_t offset, httplib::DataSink & sink) -> bool {
+                    // Send WAV header on first call
+                    if (!state->header_sent) {
+                        std::lock_guard<std::mutex> lock(state->mutex);
+                        state->header_sent = true;
+
+                        struct __attribute__((packed)) WAVHeader {
+                            char     riff[4]     = {'R','I','F','F'};
+                            uint32_t riff_size   = 0xFFFFFFFF;
+                            char     wave[4]     = {'W','A','V','E'};
+                            char     fmt_[4]     = {'f','m','t',' '};
+                            uint32_t fmt_size    = 16;
+                            uint16_t audio_fmt   = 1;
+                            uint16_t channels    = 1;
+                            uint32_t sample_rate = 24000;
+                            uint32_t byte_rate   = 48000;
+                            uint16_t block_align = 2;
+                            uint16_t bits         = 16;
+                            char     data[4]     = {'d','a','t','a'};
+                            uint32_t data_size   = 0xFFFFFFFF;
+                        } header;
+
+                        sink.write(reinterpret_cast<const char *>(&header), sizeof(header));
+                    }
+
+                    // Drain available PCM
+                    std::vector<int16_t> to_send;
+                    {
+                        std::unique_lock<std::mutex> lock(state->mutex);
+                        if (state->buffer.empty() && !state->done) {
+                            // Wait for more PCM or completion
+                            state->cv.wait_for(lock, std::chrono::milliseconds(100),
+                                                [&] { return !state->buffer.empty() || state->done; });
+                        }
+
+                        if (!state->buffer.empty()) {
+                            to_send = std::move(state->buffer);
+                            state->buffer.clear();
+                        }
+                    }
+
+                    if (!to_send.empty()) {
+                        sink.write(reinterpret_cast<const char *>(to_send.data()),
+                                   to_send.size() * sizeof(int16_t));
+                        return true;  // continue
+                    }
+
+                    // No more data and synthesis is done
+                    if (state->done) {
+                        sink.done();
+                        return true;
+                    }
+
+                    return true;  // will be called again
+                },
+                [](bool) {}
+            );
+        });
+
     // ---- Graceful shutdown logging ----
     svr.set_logger([](const httplib::Request & req, const httplib::Response & res) {
         fprintf(stderr, "[%d] %s %s\n", res.status, req.method.c_str(), req.path.c_str());
@@ -621,6 +839,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "  GET  /api/health\n");
     fprintf(stderr, "  POST /api/synthesize\n");
     fprintf(stderr, "  POST /api/synthesize_stream\n");
+    fprintf(stderr, "  POST /api/synthesize_frame_stream\n");
 
     if (!svr.listen(host.c_str(), port)) {
         fprintf(stderr, "Error: failed to listen on %s:%d\n", host.c_str(), port);
