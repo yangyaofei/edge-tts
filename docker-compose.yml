@@ -1,21 +1,30 @@
 services:
   # -----------------------------------------------------------------------
-  # qwen3-tts-server — C++ HTTP server wrapping qwen3-tts.cpp
+  # qwen3-tts-pytorch — Python TTS server (faster-qwen3-tts + CUDA Graph)
+  # RTF ~1.49 on GTX 1080 Ti, TTFA ~0.48s
   # -----------------------------------------------------------------------
   qwen3-tts-server:
     build:
-      context: ./docker/qwen3-tts-server
-    image: edge-tts-qwen3-tts-server:latest
+      context: ./docker/qwen3-tts-pytorch
+    image: edge-tts-qwen3-pytorch:latest
     container_name: edge-tts-qwen3-server
     ports:
       - "9880:9880"
     volumes:
-      # Mount GGUF models into /models
-      # Expected files:
-      #   qwen3-tts-0.6b-q8_0.gguf  (or qwen3-tts-0.6b-f16.gguf)
-      #   qwen3-tts-tokenizer-f16.gguf
-      - ./models:/models:ro
-    command: ["--model-dir", "/models", "--port", "9880"]
+      # Mount HuggingFace model cache (auto-downloads on first start if empty)
+      - ./models:/models
+    environment:
+      - TTS_MODEL=Qwen/Qwen3-TTS-12Hz-0.6B-Base
+      - TTS_DEVICE=cuda
+      - PORT=9880
+      - HF_HOME=/models/hf_cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     logging:
       driver: "json-file"
       options:
@@ -24,7 +33,7 @@ services:
     restart: unless-stopped
 
   # -----------------------------------------------------------------------
-  # backend — main application backend (placeholder)
+  # backend — main application backend
   # -----------------------------------------------------------------------
   backend:
     build:
@@ -34,13 +43,12 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # Map local config directory for persistent settings
-      # config.env will be generated in ./config/config.env if it doesn't exist
       - ./config:/app/config
-    #environment:
-    #  # SECRET_KEY will be loaded from the mounted .env file
+    environment:
+      - QWEN3_TTS_SERVER_URL=http://qwen3-tts-server:9880
     depends_on:
-      - qwen3-tts-server
+      qwen3-tts-server:
+        condition: service_healthy
     logging:
       driver: "json-file"
       options:

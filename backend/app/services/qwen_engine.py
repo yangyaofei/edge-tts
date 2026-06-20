@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import logging
 from typing import Any, AsyncGenerator
 
@@ -10,11 +9,10 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen3TTSEngine:
-    """qwen3-tts-server 的 HTTP 客户端。
+    """qwen3-tts-pytorch server 的 HTTP 客户端。
 
-    通过 generate_chunk 实现 TTSEngine Protocol。
-    支持 ref_audio 声音克隆。
-    generate_chunk_stream 支持流式接收音频（降低首字延迟）。
+    通过 faster-qwen3-tts + CUDA Graph 实现推理加速。
+    支持流式和非流式合成。
     """
 
     def __init__(
@@ -22,7 +20,7 @@ class Qwen3TTSEngine:
         server_url: str = "http://localhost:9880",
         language: str = "zh",
         max_tokens: int = 8192,
-        timeout: float = 300.0,
+        timeout: float = 600.0,
     ) -> None:
         self.server_url = server_url.rstrip("/")
         self.language = language
@@ -36,8 +34,13 @@ class Qwen3TTSEngine:
         speed: float = 1.0,
         ref_audio: bytes | None = None,
     ) -> bytes:
-        """调用 qwen3-tts-server 生成一段音频，返回完整 WAV bytes。"""
-        payload = self._build_payload(text, ref_audio)
+        """调用 TTS server 生成一段音频，返回完整 WAV bytes。"""
+        payload: dict[str, Any] = {
+            "text": text,
+            "language": self.language,
+        }
+
+        logger.debug(f"Qwen3TTSEngine: POST {self.server_url}/api/synthesize, {len(text)} chars")
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(
@@ -54,11 +57,11 @@ class Qwen3TTSEngine:
         speed: float = 1.0,
         ref_audio: bytes | None = None,
     ) -> AsyncGenerator[bytes, None]:
-        """流式接收音频：server 按句子切分，边生成边返回。
-
-        首字延迟从"整段生成完"降到"首句生成完"。
-        """
-        payload = self._build_payload(text, ref_audio)
+        """流式合成：server 按句子切分，边生成边返回 PCM。"""
+        payload: dict[str, Any] = {
+            "text": text,
+            "language": self.language,
+        }
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             async with client.stream(
@@ -71,16 +74,6 @@ class Qwen3TTSEngine:
                     if chunk:
                         yield chunk
 
-    def _build_payload(self, text: str, ref_audio: bytes | None = None) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "text": text,
-            "language": self.language,
-            "max_tokens": self.max_tokens,
-        }
-        if ref_audio:
-            payload["ref_audio"] = base64.b64encode(ref_audio).decode()
-        return payload
-
     async def get_voices(self) -> list[dict[str, Any]]:
         return [
             {"id": "default", "name": "Qwen3-TTS 默认", "language": "zh"},
@@ -88,7 +81,7 @@ class Qwen3TTSEngine:
 
     async def health_check(self) -> bool:
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(f"{self.server_url}/api/health")
                 return resp.status_code == 200
         except Exception:
