@@ -15,5 +15,10 @@ dependencies = [
     "pydantic>=2.0.0",
 ]
 
-[tool.uv]
-index-url = "https://download.pytorch.org/whl/cu121"
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchaudio = { index = "pytorch" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu121"

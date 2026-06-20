@@ -10,13 +10,18 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.12 \
-        python3.12-venv \
-        python3-pip \
+        software-properties-common \
         curl \
         libsndfile1 \
         ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 \
+        python3.12-venv \
+        python3.12-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3.12 -m ensurepip \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
 
 # Install uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -30,6 +35,9 @@ RUN uv venv && uv sync
 
 # Copy server code
 COPY server.py .
+
+# Generate a minimal reference audio for speaker embedding extraction
+RUN uv run python -c "import numpy as np, wave; sr=24000; t=np.linspace(0,3,int(sr*3),endpoint=False); a=(np.sin(2*np.pi*220*t)*0.3*32767).astype(np.int16); w=wave.open('ref_audio.wav','w'); w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr); w.writeframes(a.tobytes()); w.close(); print('ref_audio.wav ok')"
 
 # Model cache directory (mount or auto-download)
 ENV HF_HOME=/models/hf_cache
