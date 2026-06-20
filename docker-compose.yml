@@ -41,7 +41,7 @@ services:
     image: ghcr.io/yangyaofei/edge-tts-backend:latest
     container_name: edge-tts-backend
     ports:
-      - "8000:8000"
+      - "8900:8000"
     volumes:
       - ./config:/app/config
     environment:
