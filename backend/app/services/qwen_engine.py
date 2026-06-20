@@ -35,6 +35,8 @@ class Qwen3TTSEngine:
         ref_audio: bytes | None = None,
         temperature: float | None = None,
         instruct: str | None = None,
+        pitch: float = 0.0,
+        volume: float = 1.0,
     ) -> bytes:
         """调用 TTS server 生成一段音频，返回完整 WAV bytes。"""
         payload: dict[str, Any] = {
@@ -42,6 +44,8 @@ class Qwen3TTSEngine:
             "language": self.language,
             "voice": voice,
             "speed": speed,
+            "pitch": pitch,
+            "volume": volume,
         }
         if temperature is not None:
             payload["temperature"] = temperature
@@ -66,6 +70,8 @@ class Qwen3TTSEngine:
         ref_audio: bytes | None = None,
         temperature: float | None = None,
         instruct: str | None = None,
+        pitch: float = 0.0,
+        volume: float = 1.0,
     ) -> AsyncGenerator[bytes, None]:
         """流式合成：server 按句子切分，边生成边返回 PCM。"""
         payload: dict[str, Any] = {
@@ -73,6 +79,8 @@ class Qwen3TTSEngine:
             "language": self.language,
             "voice": voice,
             "speed": speed,
+            "pitch": pitch,
+            "volume": volume,
         }
         if temperature is not None:
             payload["temperature"] = temperature

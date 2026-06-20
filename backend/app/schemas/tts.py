@@ -19,6 +19,8 @@ class TTSRequest(BaseModel):
     engine: str = "edge"
     voice: str = "zh-CN-XiaoxiaoNeural"
     speed: float = 1.0
+    pitch: float = 0.0
+    volume: float = 1.0
     preprocess: bool = True
     language: str = "zh"
     temperature: Optional[float] = None

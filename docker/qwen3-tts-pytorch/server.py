@@ -131,19 +131,38 @@ def write_full_wav(pcm: np.ndarray, sr: int) -> bytes:
 
 
 def speed_change(pcm: np.ndarray, sr: int, speed: float) -> np.ndarray:
-    """Simple speed change via resampling. speed>1 = faster, <1 = slower."""
+    """Time-stretch: speed>1 = faster, pitch preserved. Uses librosa WSOLA."""
     if abs(speed - 1.0) < 0.01:
         return pcm
-    try:
-        import torchaudio
-        tensor = torch.from_numpy(pcm).float().unsqueeze(0)
-        new_len = int(len(pcm) / speed)
-        resampled = torchaudio.functional.resample(tensor, len(pcm), new_len)
-        return resampled.squeeze(0).numpy()
-    except Exception:
-        # Fallback: simple stride
-        indices = np.arange(0, len(pcm), speed)
-        return np.interp(indices, np.arange(len(pcm)), pcm)
+    import librosa
+    return librosa.effects.time_stretch(pcm.astype(np.float32), rate=1.0 / speed)
+
+
+def pitch_change(pcm: np.ndarray, sr: int, n_semitones: float) -> np.ndarray:
+    """Pitch-shift: n_semitones>0 = higher, tempo preserved. Uses librosa."""
+    if abs(n_semitones) < 0.01:
+        return pcm
+    import librosa
+    return librosa.effects.pitch_shift(pcm.astype(np.float32), sr=sr, n_steps=n_semitones)
+
+
+def volume_change(pcm: np.ndarray, volume: float) -> np.ndarray:
+    """Volume scale: 1.0=original, 1.5=+50%, 0.5=half."""
+    if abs(volume - 1.0) < 0.01:
+        return pcm
+    return np.clip(pcm * volume, -1.0, 1.0)
+
+
+def post_process(pcm: np.ndarray, sr: int, speed: float = 1.0,
+                 pitch: float = 0.0, volume: float = 1.0) -> np.ndarray:
+    """Apply DSP post-processing: pitch_shift → time_stretch → volume."""
+    if pitch != 0.0:
+        pcm = pitch_change(pcm, sr, pitch)
+    if speed != 1.0:
+        pcm = speed_change(pcm, sr, speed)
+    if volume != 1.0:
+        pcm = volume_change(pcm, volume)
+    return pcm
 
 
 # --------------------------------------------------------------------------- #
@@ -287,7 +306,8 @@ class TTSModel:
 
     def gen_full(self, text: str, language: str, voice: str = "default",
                  temperature: float = 0.9, instruct: Optional[str] = None,
-                 speed: float = 1.0) -> Tuple[np.ndarray, int]:
+                 speed: float = 1.0, pitch: float = 0.0, volume: float = 1.0
+                 ) -> Tuple[np.ndarray, int]:
         with self.lock:
             arrays, sr = self.model.generate_voice_clone(
                 **self._build_kwargs(text, language, streaming=False,
@@ -296,8 +316,7 @@ class TTSModel:
             pcm = np.concatenate(
                 [np.asarray(a, dtype=np.float32).reshape(-1) for a in arrays]
             ) if arrays else np.zeros(0, dtype=np.float32)
-            if speed != 1.0:
-                pcm = speed_change(pcm, sr, speed)
+            pcm = post_process(pcm, sr, speed=speed, pitch=pitch, volume=volume)
             return pcm, int(sr)
 
 
@@ -312,8 +331,10 @@ class SynthReq(BaseModel):
     language: Optional[str] = "chinese"
     voice: Optional[str] = "default"
     temperature: Optional[float] = 0.9
-    speed: Optional[float] = 1.0
-    instruct: Optional[str] = None
+    speed: Optional[float] = 1.0          # 1.0=原速, 1.5=快1.5倍, 0.8=慢
+    pitch: Optional[float] = 0.0          # 半音, +2=升2半音, -3=降3半音
+    volume: Optional[float] = 1.0         # 1.0=原音量, 1.5=+50%, 0.5=减半
+    instruct: Optional[str] = None        # 仅 1.7B CustomVoice 有效
     max_new_tokens: Optional[int] = None
 
 
@@ -376,11 +397,13 @@ def synthesize(req: SynthReq):
     voice = req.voice or "default"
     temperature = req.temperature if req.temperature is not None else 0.9
     speed = req.speed if req.speed is not None else 1.0
+    pitch = req.pitch if req.pitch is not None else 0.0
+    volume = req.volume if req.volume is not None else 1.0
     instruct = req.instruct
 
     t0 = time.perf_counter()
     pcm, sr = M.gen_full(text, lang, voice=voice, temperature=temperature,
-                         instruct=instruct, speed=speed)
+                         instruct=instruct, speed=speed, pitch=pitch, volume=volume)
     dt = time.perf_counter() - t0
     dur = len(pcm) / sr if sr else 0.0
     wav = write_full_wav(pcm, sr)
@@ -410,10 +433,12 @@ def synthesize_stream(req: SynthReq):
     voice = req.voice or "default"
     temperature = req.temperature if req.temperature is not None else 0.9
     speed = req.speed if req.speed is not None else 1.0
+    pitch = req.pitch if req.pitch is not None else 0.0
+    volume = req.volume if req.volume is not None else 1.0
     instruct = req.instruct
     sentences = split_sentences(text) or [text]
-    log.info("/synthesize_stream voice=%s lang=%s temp=%.1f sentences=%d chars=%d%s",
-             voice, lang, temperature, len(sentences), len(text),
+    log.info("/synthesize_stream voice=%s lang=%s temp=%.1f speed=%.1f pitch=%.1f sentences=%d chars=%d%s",
+             voice, lang, temperature, speed, len(sentences), len(text),
              f" instruct='{instruct[:30]}...'" if instruct else "")
 
     q: Queue = Queue(maxsize=QUEUE_SIZE)
@@ -429,8 +454,7 @@ def synthesize_stream(req: SynthReq):
                 for pcm, sr in M.gen_stream(s, lang, voice=voice,
                                             temperature=temperature, instruct=instruct):
                     sr_out = sr
-                    if speed != 1.0:
-                        pcm = speed_change(pcm, sr, speed)
+                    pcm = post_process(pcm, sr, speed=speed, pitch=pitch, volume=volume)
                     total_samples += len(pcm)
                     q.put(("audio", (pcm_to_i16_bytes(pcm), sr)))
             q.put(_DONE)

@@ -99,6 +99,8 @@ async def create_speech(request: Request):
     stream_format = body.get("stream_format", "audio") or "audio"
     instructions = body.get("instructions")  # OpenAI's natural language instruction
     temperature = body.get("temperature")    # Custom extension: control randomness
+    pitch = body.get("pitch", 0.0)           # Custom: semitones
+    volume = body.get("volume", 1.0)         # Custom: gain multiplier
 
     engine_type, voice_id = _resolve_engine_and_voice(model, voice_raw)
 
@@ -116,6 +118,10 @@ async def create_speech(request: Request):
                 extra_kwargs["instruct"] = instructions
             if temperature is not None:
                 extra_kwargs["temperature"] = temperature
+            if pitch:
+                extra_kwargs["pitch"] = pitch
+            if volume != 1.0:
+                extra_kwargs["volume"] = volume
 
         audio_gen = pipeline.generate_stream(
             text, voice=voice_id, speed=speed,
