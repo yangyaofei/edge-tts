@@ -97,6 +97,8 @@ async def create_speech(request: Request):
     audio_format = body.get("response_format", "mp3") or "mp3"
     speed = body.get("speed", 1.0) or 1.0
     stream_format = body.get("stream_format", "audio") or "audio"
+    instructions = body.get("instructions")  # OpenAI's natural language instruction
+    temperature = body.get("temperature")    # Custom extension: control randomness
 
     engine_type, voice_id = _resolve_engine_and_voice(model, voice_raw)
 
@@ -106,7 +108,19 @@ async def create_speech(request: Request):
 
     try:
         pipeline = _build_pipeline(engine_type)
-        audio_gen = pipeline.generate_stream(text, voice=voice_id, speed=speed)
+
+        # Pass engine-specific params
+        extra_kwargs = {}
+        if engine_type == "qwen":
+            if instructions:
+                extra_kwargs["instruct"] = instructions
+            if temperature is not None:
+                extra_kwargs["temperature"] = temperature
+
+        audio_gen = pipeline.generate_stream(
+            text, voice=voice_id, speed=speed,
+            **extra_kwargs,
+        )
 
         if stream_format == "sse":
             async def sse_stream():

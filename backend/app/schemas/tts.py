@@ -21,6 +21,8 @@ class TTSRequest(BaseModel):
     speed: float = 1.0
     preprocess: bool = True
     language: str = "zh"
+    temperature: Optional[float] = None
+    instruct: Optional[str] = None
 
 
 class VoiceInfo(BaseModel):

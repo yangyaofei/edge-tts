@@ -12,7 +12,7 @@ class Qwen3TTSEngine:
     """qwen3-tts-pytorch server 的 HTTP 客户端。
 
     通过 faster-qwen3-tts + CUDA Graph 实现推理加速。
-    支持流式和非流式合成。
+    支持声音选择、语速、温度、自然语言指令。
     """
 
     def __init__(
@@ -33,14 +33,22 @@ class Qwen3TTSEngine:
         voice: str = "default",
         speed: float = 1.0,
         ref_audio: bytes | None = None,
+        temperature: float | None = None,
+        instruct: str | None = None,
     ) -> bytes:
         """调用 TTS server 生成一段音频，返回完整 WAV bytes。"""
         payload: dict[str, Any] = {
             "text": text,
             "language": self.language,
+            "voice": voice,
+            "speed": speed,
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if instruct:
+            payload["instruct"] = instruct
 
-        logger.debug(f"Qwen3TTSEngine: POST {self.server_url}/api/synthesize, {len(text)} chars")
+        logger.debug(f"Qwen3TTSEngine: POST synthesize, {len(text)} chars, voice={voice}")
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(
@@ -56,12 +64,20 @@ class Qwen3TTSEngine:
         voice: str = "default",
         speed: float = 1.0,
         ref_audio: bytes | None = None,
+        temperature: float | None = None,
+        instruct: str | None = None,
     ) -> AsyncGenerator[bytes, None]:
         """流式合成：server 按句子切分，边生成边返回 PCM。"""
         payload: dict[str, Any] = {
             "text": text,
             "language": self.language,
+            "voice": voice,
+            "speed": speed,
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if instruct:
+            payload["instruct"] = instruct
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             async with client.stream(
@@ -75,9 +91,15 @@ class Qwen3TTSEngine:
                         yield chunk
 
     async def get_voices(self) -> list[dict[str, Any]]:
-        return [
-            {"id": "default", "name": "Qwen3-TTS 默认", "language": "zh"},
-        ]
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{self.server_url}/api/voices")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("voices", [])
+        except Exception:
+            pass
+        return [{"id": "default", "name": "Qwen3-TTS 默认", "language": "multilingual"}]
 
     async def health_check(self) -> bool:
         try:

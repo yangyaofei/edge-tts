@@ -5,14 +5,16 @@
 做法 (how):
   - 模型启动时加载一次 + 预捕获 CUDA Graph + 预计算 speaker embedding
   - /api/synthesize        非流式，整段生成后返回完整 WAV
-  - /api/synthesize_stream 流式，段落并行 pipeline：producer 线程在 GPU 上
-                           连续生成并往有界队列推 PCM，HTTP writer 同时把队列
-                           里的 PCM 发出去 → 生成与网络发送重叠
+  - /api/synthesize_stream 流式，段落并行 pipeline
+  - /api/voices            列出可用声音（参考音频）
+  - POST /api/ref_audio    上传自定义参考音频（声音克隆）
 
 Endpoints:
   GET  /api/health
+  GET  /api/voices
   POST /api/synthesize         (non-streaming, returns full WAV)
   POST /api/synthesize_stream  (streaming, chunked WAV via pipeline)
+  POST /api/ref_audio          (upload reference audio for voice cloning)
 """
 
 from __future__ import annotations
@@ -25,12 +27,13 @@ import struct
 import threading
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from queue import Queue
 from typing import Generator, List, Optional, Tuple
 
 import numpy as np
 import torch
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
@@ -47,10 +50,11 @@ REF_TEXT = os.environ.get(
 DEVICE = os.environ.get("TTS_DEVICE", "cuda")
 DTYPE = torch.bfloat16
 MAX_SEQ_LEN = int(os.environ.get("TTS_MAX_SEQ_LEN", "2048"))
-CHUNK_SIZE = int(os.environ.get("TTS_CHUNK_SIZE", "8"))      # 8 steps ≈ 667ms/chunk
+CHUNK_SIZE = int(os.environ.get("TTS_CHUNK_SIZE", "8"))
 MAX_NEW_TOKENS = int(os.environ.get("TTS_MAX_NEW_TOKENS", "2048"))
-XVEC_ONLY = os.environ.get("TTS_XVEC_ONLY", "1") == "1"      # clean multilingual
-QUEUE_SIZE = int(os.environ.get("TTS_QUEUE_SIZE", "32"))     # pipeline backpressure
+XVEC_ONLY = os.environ.get("TTS_XVEC_ONLY", "1") == "1"
+QUEUE_SIZE = int(os.environ.get("TTS_QUEUE_SIZE", "32"))
+REF_AUDIO_DIR = Path(os.environ.get("TTS_REF_AUDIO_DIR", "/app/ref_audios"))
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s"
@@ -79,15 +83,10 @@ def normalize_language(lang: Optional[str]) -> str:
     return _LANG_ALIAS.get(k, k)
 
 
-# --------------------------------------------------------------------------- #
-# Sentence splitting (CJK + Latin aware)
-# 目的: 把长文本切成句，让第一句尽快出第一块音频；后续句与前面句的发送重叠。
-# --------------------------------------------------------------------------- #
 def split_sentences(text: str, min_len: int = 4) -> List[str]:
     text = (text or "").strip()
     if not text:
         return []
-    # split after CJK/latin sentence enders or newlines, keep the delimiter
     parts = re.split(r"(?<=[。！？!?；;\n])", text)
     out: List[str] = []
     buf = ""
@@ -113,13 +112,9 @@ def pcm_to_i16_bytes(x: np.ndarray) -> bytes:
 
 
 def wav_header(sr: int, channels: int = 1, bits: int = 16, n_frames: Optional[int] = None) -> bytes:
-    """Canonical 44-byte WAV header. n_frames=None → 0x7FFFFFFF (streaming)."""
     byte_rate = sr * channels * bits // 8
     block_align = channels * bits // 8
-    if n_frames is None:
-        data_sz = 0x7FFFFFFF
-    else:
-        data_sz = n_frames * block_align
+    data_sz = 0x7FFFFFFF if n_frames is None else n_frames * block_align
     riff_sz = 36 + data_sz
     return struct.pack(
         "<4sI4s4sIHHIIHH4sI",
@@ -135,6 +130,22 @@ def write_full_wav(pcm: np.ndarray, sr: int) -> bytes:
     return wav_header(sr, n_frames=len(i16)) + i16.tobytes()
 
 
+def speed_change(pcm: np.ndarray, sr: int, speed: float) -> np.ndarray:
+    """Simple speed change via resampling. speed>1 = faster, <1 = slower."""
+    if abs(speed - 1.0) < 0.01:
+        return pcm
+    try:
+        import torchaudio
+        tensor = torch.from_numpy(pcm).float().unsqueeze(0)
+        new_len = int(len(pcm) / speed)
+        resampled = torchaudio.functional.resample(tensor, len(pcm), new_len)
+        return resampled.squeeze(0).numpy()
+    except Exception:
+        # Fallback: simple stride
+        indices = np.arange(0, len(pcm), speed)
+        return np.interp(indices, np.arange(len(pcm)), pcm)
+
+
 # --------------------------------------------------------------------------- #
 # Model wrapper (singleton)
 # --------------------------------------------------------------------------- #
@@ -143,9 +154,10 @@ class TTSModel:
         self.model = None
         self.sr: int = 24000
         self.voice_prompt = None
-        self.lock = threading.Lock()  # GPU is serial → one generation at a time
+        self.lock = threading.Lock()
         self.ready = False
         self.lang_set = set()
+        self.ref_audios: dict[str, dict] = {}  # voice_id → {path, prompt, name}
 
     def load(self) -> None:
         from faster_qwen3_tts import FasterQwen3TTS
@@ -167,75 +179,125 @@ class TTSModel:
             time.perf_counter() - t0, self.sr,
             torch.cuda.memory_allocated() / 1e9, len(self.lang_set),
         )
-        self._precompute_prompt()
+        self._register_default_voice()
+        self._load_ref_audios()
         self._warmup()
         self.ready = True
-        log.info("TTSModel READY")
+        log.info("TTSModel READY  voices=%s", list(self.ref_audios.keys()))
 
-    def _build_kwargs(self, text: str, language: str, streaming: bool) -> dict:
+    def _register_default_voice(self) -> None:
+        """Register the default reference audio as voice 'default'."""
+        prompt = self._compute_prompt(REF_AUDIO, REF_TEXT)
+        self.ref_audios["default"] = {
+            "name": "默认声音",
+            "path": REF_AUDIO,
+            "prompt": prompt,
+        }
+
+    def _load_ref_audios(self) -> None:
+        """Load all reference audio files from REF_AUDIO_DIR."""
+        REF_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+        for wav_file in REF_AUDIO_DIR.glob("*.wav"):
+            voice_id = wav_file.stem
+            if voice_id == "default":
+                continue
+            prompt = self._compute_prompt(str(wav_file), "")
+            self.ref_audios[voice_id] = {
+                "name": voice_id,
+                "path": str(wav_file),
+                "prompt": prompt,
+            }
+            log.info("loaded voice: %s from %s", voice_id, wav_file)
+
+    def register_voice(self, voice_id: str, wav_path: str, name: str = "") -> bool:
+        """Register a new voice from an audio file."""
+        prompt = self._compute_prompt(wav_path, "")
+        if prompt is None:
+            return False
+        self.ref_audios[voice_id] = {
+            "name": name or voice_id,
+            "path": wav_path,
+            "prompt": prompt,
+        }
+        log.info("registered voice: %s", voice_id)
+        return True
+
+    def _compute_prompt(self, ref_audio: str, ref_text: str):
+        try:
+            if XVEC_ONLY:
+                items = self.model.model.create_voice_clone_prompt(
+                    ref_audio=ref_audio, ref_text="", x_vector_only_mode=True
+                )
+                spk = items[0].ref_spk_embedding
+                return {"ref_spk_embedding": [spk]}
+            else:
+                items = self.model.model.create_voice_clone_prompt(
+                    ref_audio=ref_audio, ref_text=ref_text, x_vector_only_mode=False
+                )
+                return items
+        except Exception as e:
+            log.warning("compute prompt failed for %s: %s", ref_audio, e)
+            return None
+
+    def _warmup(self) -> None:
+        try:
+            t0 = time.perf_counter()
+            n = 0
+            for _ in self.model.generate_voice_clone_streaming(
+                **self._build_kwargs("warmup.", "english", streaming=True,
+                                     voice="default", temperature=0.9, instruct=None)
+            ):
+                n += 1
+            log.info("warmup ok %.1fs  chunks=%d  peakVRAM=%.2fGB",
+                     time.perf_counter() - t0, n,
+                     torch.cuda.max_memory_allocated() / 1e9)
+        except Exception as e:
+            log.warning("warmup failed: %s", e)
+
+    def _build_kwargs(self, text: str, language: str, streaming: bool,
+                      voice: str = "default", temperature: float = 0.9,
+                      instruct: Optional[str] = None) -> dict:
         kw = dict(
             text=text, language=language, xvec_only=XVEC_ONLY,
-            max_new_tokens=MAX_NEW_TOKENS, ref_text="" if XVEC_ONLY else REF_TEXT,
+            max_new_tokens=MAX_NEW_TOKENS,
+            ref_text="" if XVEC_ONLY else REF_TEXT,
+            temperature=temperature,
+            instruct=instruct,
         )
         if streaming:
             kw["chunk_size"] = CHUNK_SIZE
-        if self.voice_prompt is not None:
-            kw["voice_clone_prompt"] = self.voice_prompt
+
+        voice_data = self.ref_audios.get(voice) or self.ref_audios.get("default")
+        if voice_data and voice_data.get("prompt") is not None:
+            kw["voice_clone_prompt"] = voice_data["prompt"]
             kw["ref_audio"] = None
         else:
             kw["ref_audio"] = REF_AUDIO
         return kw
 
-    def _precompute_prompt(self) -> None:
-        try:
-            if XVEC_ONLY:
-                items = self.model.model.create_voice_clone_prompt(
-                    ref_audio=REF_AUDIO, ref_text="", x_vector_only_mode=True
-                )
-                spk = items[0].ref_spk_embedding
-                self.voice_prompt = {"ref_spk_embedding": [spk]}
-            else:
-                items = self.model.model.create_voice_clone_prompt(
-                    ref_audio=REF_AUDIO, ref_text=REF_TEXT, x_vector_only_mode=False
-                )
-                self.voice_prompt = items
-            log.info("precomputed voice_clone_prompt (xvec_only=%s)", XVEC_ONLY)
-        except Exception as e:
-            log.warning("precompute prompt failed (%s); fallback to ref_audio per call", e)
-            self.voice_prompt = None
-
-    def _warmup(self) -> None:
-        # Capture CUDA graphs (predictor + talker) so real requests skip capture.
-        try:
-            t0 = time.perf_counter()
-            n = 0
-            for _ in self.model.generate_voice_clone_streaming(
-                **self._build_kwargs("warmup.", "english", streaming=True)
-            ):
-                n += 1
-            log.info(
-                "warmup ok %.1fs  chunks=%d  peakVRAM=%.2fGB",
-                time.perf_counter() - t0, n,
-                torch.cuda.max_memory_allocated() / 1e9,
-            )
-        except Exception as e:
-            log.warning("warmup failed: %s", e)
-
-    def gen_stream(self, text: str, language: str) -> Generator[Tuple[np.ndarray, int], None, None]:
+    def gen_stream(self, text: str, language: str, voice: str = "default",
+                   temperature: float = 0.9, instruct: Optional[str] = None
+                   ) -> Generator[Tuple[np.ndarray, int], None, None]:
         with self.lock:
             for chunk, sr, _t in self.model.generate_voice_clone_streaming(
-                **self._build_kwargs(text, language, streaming=True)
+                **self._build_kwargs(text, language, streaming=True,
+                                     voice=voice, temperature=temperature, instruct=instruct)
             ):
                 yield np.asarray(chunk, dtype=np.float32).reshape(-1), int(sr)
 
-    def gen_full(self, text: str, language: str) -> Tuple[np.ndarray, int]:
+    def gen_full(self, text: str, language: str, voice: str = "default",
+                 temperature: float = 0.9, instruct: Optional[str] = None,
+                 speed: float = 1.0) -> Tuple[np.ndarray, int]:
         with self.lock:
             arrays, sr = self.model.generate_voice_clone(
-                **self._build_kwargs(text, language, streaming=False)
+                **self._build_kwargs(text, language, streaming=False,
+                                     voice=voice, temperature=temperature, instruct=instruct)
             )
             pcm = np.concatenate(
                 [np.asarray(a, dtype=np.float32).reshape(-1) for a in arrays]
             ) if arrays else np.zeros(0, dtype=np.float32)
+            if speed != 1.0:
+                pcm = speed_change(pcm, sr, speed)
             return pcm, int(sr)
 
 
@@ -248,6 +310,10 @@ M = TTSModel()
 class SynthReq(BaseModel):
     text: str
     language: Optional[str] = "chinese"
+    voice: Optional[str] = "default"
+    temperature: Optional[float] = 0.9
+    speed: Optional[float] = 1.0
+    instruct: Optional[str] = None
     max_new_tokens: Optional[int] = None
 
 
@@ -272,7 +338,31 @@ def health():
         "xvec_only": XVEC_ONLY,
         "chunk_size": CHUNK_SIZE,
         "languages": sorted(M.lang_set),
+        "voices": [{"id": vid, "name": v["name"]} for vid, v in M.ref_audios.items()],
     }
+
+
+@app.get("/api/voices")
+def get_voices():
+    return {
+        "voices": [
+            {"id": vid, "name": v["name"], "language": "multilingual"}
+            for vid, v in M.ref_audios.items()
+        ]
+    }
+
+
+@app.post("/api/ref_audio/{voice_id}")
+async def upload_ref_audio(voice_id: str, name: str = "", file: UploadFile = File(...)):
+    """Upload a reference audio file to register a new voice."""
+    REF_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    save_path = REF_AUDIO_DIR / f"{voice_id}.wav"
+    content = await file.read()
+    save_path.write_bytes(content)
+    ok = M.register_voice(voice_id, str(save_path), name)
+    if ok:
+        return {"ok": True, "voice_id": voice_id, "name": name or voice_id}
+    return JSONResponse({"error": "Failed to process reference audio"}, status_code=400)
 
 
 @app.post("/api/synthesize")
@@ -283,15 +373,20 @@ def synthesize(req: SynthReq):
     if not text:
         return JSONResponse({"error": "empty text"}, status_code=400)
     lang = normalize_language(req.language)
+    voice = req.voice or "default"
+    temperature = req.temperature if req.temperature is not None else 0.9
+    speed = req.speed if req.speed is not None else 1.0
+    instruct = req.instruct
+
     t0 = time.perf_counter()
-    pcm, sr = M.gen_full(text, lang)
+    pcm, sr = M.gen_full(text, lang, voice=voice, temperature=temperature,
+                         instruct=instruct, speed=speed)
     dt = time.perf_counter() - t0
     dur = len(pcm) / sr if sr else 0.0
     wav = write_full_wav(pcm, sr)
-    log.info(
-        "/synthesize lang=%s gen=%.2fs audio=%.2fs RTF=%.3f",
-        lang, dt, dur, (dur / dt) if dt else 0,
-    )
+    log.info("/synthesize voice=%s lang=%s temp=%.1f speed=%.1f gen=%.2fs audio=%.2fs RTF=%.3f%s",
+             voice, lang, temperature, speed, dt, dur, (dur / dt) if dt else 0,
+             f" instruct='{instruct[:30]}...'" if instruct else "")
     return Response(
         content=wav, media_type="audio/wav",
         headers={
@@ -312,51 +407,54 @@ def synthesize_stream(req: SynthReq):
     if not text:
         return JSONResponse({"error": "empty text"}, status_code=400)
     lang = normalize_language(req.language)
+    voice = req.voice or "default"
+    temperature = req.temperature if req.temperature is not None else 0.9
+    speed = req.speed if req.speed is not None else 1.0
+    instruct = req.instruct
     sentences = split_sentences(text) or [text]
-    log.info("/synthesize_stream lang=%s sentences=%d total_chars=%d", lang, len(sentences), len(text))
+    log.info("/synthesize_stream voice=%s lang=%s temp=%.1f sentences=%d chars=%d%s",
+             voice, lang, temperature, len(sentences), len(text),
+             f" instruct='{instruct[:30]}...'" if instruct else "")
 
     q: Queue = Queue(maxsize=QUEUE_SIZE)
     _DONE = ("done", None)
     _ERR = ("error", None)
 
-    # producer: pulls from GPU as fast as it produces → real overlap with network send
     def producer():
         t0 = time.perf_counter()
         total_samples = 0
         sr_out = M.sr
         try:
             for i, s in enumerate(sentences):
-                for pcm, sr in M.gen_stream(s, lang):
+                for pcm, sr in M.gen_stream(s, lang, voice=voice,
+                                            temperature=temperature, instruct=instruct):
                     sr_out = sr
+                    if speed != 1.0:
+                        pcm = speed_change(pcm, sr, speed)
                     total_samples += len(pcm)
                     q.put(("audio", (pcm_to_i16_bytes(pcm), sr)))
             q.put(_DONE)
             dt = time.perf_counter() - t0
-            log.info(
-                "producer done: gen=%.2fs audio=%.2fs RTF=%.3f",
-                dt, total_samples / sr_out if sr_out else 0,
-                (total_samples / sr_out / dt) if sr_out and dt else 0,
-            )
+            log.info("producer done: gen=%.2fs audio=%.2fs RTF=%.3f",
+                     dt, total_samples / sr_out if sr_out else 0,
+                     (total_samples / sr_out / dt) if sr_out and dt else 0)
         except Exception as e:
             log.exception("producer failed")
             q.put(_ERR)
 
     threading.Thread(target=producer, daemon=True, name="tts-producer").start()
 
-    # consumer: HTTP writer — sends WAV header then streams PCM
     def body():
         first = True
         sr = M.sr
         while True:
             kind, payload = q.get()
-            if kind == "done":
-                return
-            if kind == "error":
+            if kind in ("done", "error"):
                 return
             pcm_bytes, cs = payload
             sr = cs
             if first:
-                yield wav_header(sr, n_frames=None)  # unknown size (streaming WAV)
+                yield wav_header(sr, n_frames=None)
                 first = False
             yield pcm_bytes
 
@@ -364,7 +462,7 @@ def synthesize_stream(req: SynthReq):
         body(), media_type="audio/wav",
         headers={
             "X-Sample-Rate": str(M.sr),
-            "X-Languages": ",".join(sorted(M.lang_set)),
+            "X-Voices": ",".join(M.ref_audios.keys()),
             "Access-Control-Expose-Headers": "*",
             "Cache-Control": "no-cache",
         },

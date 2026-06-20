@@ -54,10 +54,12 @@ class TTSPipeline:
         voice: str = "default",
         speed: float = 1.0,
         use_preprocess: bool = True,
+        **engine_kwargs,
     ) -> AsyncGenerator[bytes, None]:
         """完整 pipeline 流式生成。
 
         Yields: WAV bytes
+        engine_kwargs: 传递给 engine 的额外参数 (temperature, instruct, etc.)
         """
         processed = text
 
@@ -103,6 +105,7 @@ class TTSPipeline:
                     audio_parts: list[bytes] = []
                     async for data in self.engine.generate_chunk_stream(
                         chunk_text, voice=voice, speed=speed, ref_audio=ref_audio,
+                        **engine_kwargs,
                     ):
                         audio_parts.append(data)
                         yield data
@@ -114,6 +117,7 @@ class TTSPipeline:
                         yield self._make_silence_from_engine(ref_audio, self.silence_between_chunks)
                     async for data in self.engine.generate_chunk_stream(
                         chunk_text, voice=voice, speed=speed, ref_audio=ref_audio,
+                        **engine_kwargs,
                     ):
                         yield data
             else:
