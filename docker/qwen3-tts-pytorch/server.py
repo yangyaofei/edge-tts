@@ -407,8 +407,8 @@ def synthesize(req: SynthReq):
     dt = time.perf_counter() - t0
     dur = len(pcm) / sr if sr else 0.0
     wav = write_full_wav(pcm, sr)
-    log.info("/synthesize voice=%s lang=%s temp=%.1f speed=%.1f gen=%.2fs audio=%.2fs RTF=%.3f%s",
-             voice, lang, temperature, speed, dt, dur, (dur / dt) if dt else 0,
+    log.info("/synthesize voice=%s lang=%s temp=%.1f speed=%.1f pitch=%.1f vol=%.1f gen=%.2fs audio=%.2fs RTF=%.3f%s",
+             voice, lang, temperature, speed, pitch, volume, dt, dur, (dur / dt) if dt else 0,
              f" instruct='{instruct[:30]}...'" if instruct else "")
     return Response(
         content=wav, media_type="audio/wav",
@@ -437,8 +437,8 @@ def synthesize_stream(req: SynthReq):
     volume = req.volume if req.volume is not None else 1.0
     instruct = req.instruct
     sentences = split_sentences(text) or [text]
-    log.info("/synthesize_stream voice=%s lang=%s temp=%.1f speed=%.1f pitch=%.1f sentences=%d chars=%d%s",
-             voice, lang, temperature, speed, len(sentences), len(text),
+    log.info("/synthesize_stream voice=%s lang=%s temp=%.1f speed=%.1f pitch=%.1f vol=%.1f sents=%d chars=%d%s",
+             voice, lang, temperature, speed, pitch, volume, len(sentences), len(text),
              f" instruct='{instruct[:30]}...'" if instruct else "")
 
     q: Queue = Queue(maxsize=QUEUE_SIZE)
