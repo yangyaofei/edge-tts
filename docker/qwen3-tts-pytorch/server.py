@@ -26,14 +26,15 @@ import re
 import struct
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from pathlib import Path
-from queue import Queue
+from queue import Queue, Full, Empty
 from typing import Generator, List, Optional, Tuple
 
+import asyncio
 import numpy as np
 import torch
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
@@ -436,7 +437,7 @@ def synthesize(req: SynthReq):
 
 
 @app.post("/api/synthesize_stream")
-def synthesize_stream(req: SynthReq):
+async def synthesize_stream(req: SynthReq, request: Request):
     if not M.ready:
         return JSONResponse({"error": "model not ready"}, status_code=503)
     text = (req.text or "").strip()
@@ -455,45 +456,109 @@ def synthesize_stream(req: SynthReq):
              f" instruct='{instruct[:30]}...'" if instruct else "")
 
     q: Queue = Queue(maxsize=QUEUE_SIZE)
+    cancel_event = threading.Event()
     _DONE = ("done", None)
     _ERR = ("error", None)
+    needs_post = (abs(speed - 1.0) >= 0.01 or abs(pitch) >= 0.01 or abs(volume - 1.0) >= 0.01)
 
     def producer():
         t0 = time.perf_counter()
         total_samples = 0
         sr_out = M.sr
+        def _safe_put(item):
+            """Put to queue with 10s consumer-dead timeout."""
+            deadline = time.monotonic() + 10
+            while not cancel_event.is_set():
+                if time.monotonic() > deadline:
+                    log.warning("producer: queue full 10s, consumer likely dead, aborting")
+                    return False
+                try:
+                    q.put(item, timeout=0.5)
+                    return True
+                except Full:
+                    continue
+            return False
+
         try:
             for i, s in enumerate(sentences):
-                for pcm, sr in M.gen_stream(s, lang, voice=voice,
-                                            temperature=temperature, instruct=instruct):
-                    sr_out = sr
-                    pcm = post_process(pcm, sr, speed=speed, pitch=pitch, volume=volume)
-                    total_samples += len(pcm)
-                    q.put(("audio", (pcm_to_i16_bytes(pcm), sr)))
-            q.put(_DONE)
+                if cancel_event.is_set():
+                    break
+                with closing(M.gen_stream(s, lang, voice=voice,
+                                          temperature=temperature, instruct=instruct)) as gen:
+                    if needs_post:
+                        sent_chunks = []
+                        for pcm, sr in gen:
+                            if cancel_event.is_set():
+                                break
+                            sr_out = sr
+                            sent_chunks.append(pcm)
+                        if sent_chunks and not cancel_event.is_set():
+                            full = np.concatenate(sent_chunks)
+                            full = post_process(full, sr_out, speed=speed, pitch=pitch, volume=volume)
+                            total_samples += len(full)
+                            if not _safe_put(("audio", (pcm_to_i16_bytes(full), sr_out))):
+                                break
+                    else:
+                        for pcm, sr in gen:
+                            if cancel_event.is_set():
+                                break
+                            sr_out = sr
+                            total_samples += len(pcm)
+                            pcm_bytes = pcm_to_i16_bytes(pcm)
+                            if not _safe_put(("audio", (pcm_bytes, sr))):
+                                break
+            if not cancel_event.is_set():
+                q.put(_DONE)
             dt = time.perf_counter() - t0
-            log.info("producer done: gen=%.2fs audio=%.2fs RTF=%.3f",
+            log.info("producer done: gen=%.2fs audio=%.2fs RTF=%.3f cancelled=%s",
                      dt, total_samples / sr_out if sr_out else 0,
-                     (total_samples / sr_out / dt) if sr_out and dt else 0)
+                     (total_samples / sr_out / dt) if sr_out and dt else 0,
+                     cancel_event.is_set())
         except Exception as e:
             log.exception("producer failed")
-            q.put(_ERR)
+            try:
+                q.put_nowait(_ERR)
+            except Full:
+                pass
 
     threading.Thread(target=producer, daemon=True, name="tts-producer").start()
 
-    def body():
+    async def body():
+        loop = asyncio.get_running_loop()
         first = True
         sr = M.sr
-        while True:
-            kind, payload = q.get()
-            if kind in ("done", "error"):
-                return
-            pcm_bytes, cs = payload
-            sr = cs
-            if first:
-                yield wav_header(sr, n_frames=None)
-                first = False
-            yield pcm_bytes
+        _SILENCE = b"\x00\x00"
+        try:
+            while True:
+                try:
+                    item = await loop.run_in_executor(None, lambda: q.get(timeout=1.0))
+                except Empty:
+                    if first:
+                        yield wav_header(sr, n_frames=None)
+                        first = False
+                    yield _SILENCE
+                    if await request.is_disconnected():
+                        cancel_event.set()
+                        log.info("stream: client disconnected (heartbeat+is_disconnected)")
+                        return
+                    continue
+                kind, payload = item
+                if kind in ("done", "error"):
+                    return
+                pcm_bytes, cs = payload
+                sr = cs
+                if first:
+                    yield wav_header(sr, n_frames=None)
+                    first = False
+                yield pcm_bytes
+                if await request.is_disconnected():
+                    cancel_event.set()
+                    log.info("stream: client disconnected (after chunk)")
+                    return
+        except GeneratorExit:
+            cancel_event.set()
+            log.info("stream: client disconnected (GeneratorExit), cancelling producer")
+            raise
 
     return StreamingResponse(
         body(), media_type="audio/wav",
