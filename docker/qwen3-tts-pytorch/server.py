@@ -214,19 +214,32 @@ class TTSModel:
         }
 
     def _load_ref_audios(self) -> None:
-        """Load all reference audio files from REF_AUDIO_DIR."""
+        """Load all reference audio files from REF_AUDIO_DIR.
+
+        For each voice, looks for a matching .txt file for ref_text.
+        In ICL mode (xvec_only=False), ref_text is required.
+        """
         REF_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
         for wav_file in REF_AUDIO_DIR.glob("*.wav"):
             voice_id = wav_file.stem
             if voice_id == "default":
                 continue
-            prompt = self._compute_prompt(str(wav_file), "")
+            txt_file = wav_file.with_suffix(".txt")
+            if txt_file.exists():
+                ref_text = txt_file.read_text(encoding="utf-8").strip()
+            else:
+                ref_text = "" if XVEC_ONLY else REF_TEXT
+            prompt = self._compute_prompt(str(wav_file), ref_text)
+            if prompt is None:
+                log.warning("skipped voice %s: prompt computation failed", voice_id)
+                continue
             self.ref_audios[voice_id] = {
                 "name": voice_id,
                 "path": str(wav_file),
                 "prompt": prompt,
             }
-            log.info("loaded voice: %s from %s", voice_id, wav_file)
+            log.info("loaded voice: %s from %s (ref_text=%d chars)",
+                     voice_id, wav_file, len(ref_text))
 
     def register_voice(self, voice_id: str, wav_path: str, name: str = "") -> bool:
         """Register a new voice from an audio file."""

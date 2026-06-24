@@ -13,11 +13,17 @@ services:
     volumes:
       # Mount HuggingFace model cache (auto-downloads on first start if empty)
       - ./models:/models
+      # Mount reference audio files for voice cloning
+      - ./docker/qwen3-tts-pytorch/ref_audios:/app/ref_audios:ro
     environment:
       - TTS_MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-Base
       - TTS_DEVICE=cuda
       - PORT=9880
       - HF_HOME=/models/hf_cache
+      - TTS_REF_AUDIO=/app/ref_audios/ref_zh.wav
+      - TTS_REF_TEXT=人工智能技术在过去几年里取得了巨大的进步，尤其是在自然语言处理和大语言模型方面。
+      - TTS_XVEC_ONLY=0
+      - TTS_REF_AUDIO_DIR=/app/ref_audios
     deploy:
       resources:
         reservations:
