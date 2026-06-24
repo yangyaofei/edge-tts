@@ -19,7 +19,6 @@ Endpoints:
 
 from __future__ import annotations
 
-import io
 import logging
 import os
 import re
@@ -514,7 +513,7 @@ async def synthesize_stream(req: SynthReq, request: Request):
                      dt, total_samples / sr_out if sr_out else 0,
                      (total_samples / sr_out / dt) if sr_out and dt else 0,
                      cancel_event.is_set())
-        except Exception as e:
+        except Exception:
             log.exception("producer failed")
             try:
                 q.put_nowait(_ERR)
