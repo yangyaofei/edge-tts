@@ -40,3 +40,7 @@ research/
 # Vendored header-only libs (downloaded in Dockerfile)
 docker/qwen3-tts-server/httplib.h
 docker/qwen3-tts-server/json.hpp
+
+# Build artifacts
+.qwen3tts-work/
+docker/qwen3-tts-server/build/

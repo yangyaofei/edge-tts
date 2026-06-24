@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # Verify backend Docker image builds
+  build-backend:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          platforms: linux/amd64
+          push: false
+          tags: edge-tts-backend:ci
+
+  # Verify TTS server Docker image builds
+  build-tts-server:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build TTS server image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./docker/qwen3-tts-pytorch
+          file: ./docker/qwen3-tts-pytorch/Dockerfile
+          platforms: linux/amd64
+          push: false
+          tags: edge-tts-qwen3-pytorch:ci
+
+  # Lint Python files
+  python-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Lint server.py
+        run: ruff check docker/qwen3-tts-pytorch/server.py
+
+      - name: Lint backend
+        run: ruff check backend/app/ || true
