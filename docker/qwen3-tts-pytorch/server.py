@@ -135,7 +135,7 @@ def speed_change(pcm: np.ndarray, sr: int, speed: float) -> np.ndarray:
     if abs(speed - 1.0) < 0.01:
         return pcm
     import librosa
-    return librosa.effects.time_stretch(pcm.astype(np.float32), rate=1.0 / speed)
+    return librosa.effects.time_stretch(pcm.astype(np.float32), rate=speed)
 
 
 def pitch_change(pcm: np.ndarray, sr: int, n_semitones: float) -> np.ndarray:
