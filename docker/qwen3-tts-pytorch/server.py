@@ -131,11 +131,15 @@ def write_full_wav(pcm: np.ndarray, sr: int) -> bytes:
 
 
 def speed_change(pcm: np.ndarray, sr: int, speed: float) -> np.ndarray:
-    """Time-stretch: speed>1 = faster, pitch preserved. Uses librosa WSOLA."""
+    """Time-stretch: speed>1 = faster, pitch preserved. Uses WSOLA (audiotsm)."""
     if abs(speed - 1.0) < 0.01:
         return pcm
-    import librosa
-    return librosa.effects.time_stretch(pcm.astype(np.float32), rate=speed)
+    from audiotsm import wsola
+    from audiotsm.io.array import ArrayReader, ArrayWriter
+    reader = ArrayReader(pcm.reshape(1, -1).astype(np.float32))
+    writer = ArrayWriter(channels=1)
+    wsola(reader.channels, speed=speed).run(reader, writer)
+    return writer.data[0]
 
 
 def pitch_change(pcm: np.ndarray, sr: int, n_semitones: float) -> np.ndarray:
@@ -310,27 +314,39 @@ class TTSModel:
     def gen_stream(self, text: str, language: str, voice: str = "default",
                    temperature: float = 0.9, instruct: Optional[str] = None
                    ) -> Generator[Tuple[np.ndarray, int], None, None]:
-        with self.lock:
-            for chunk, sr, _t in self.model.generate_voice_clone_streaming(
-                **self._build_kwargs(text, language, streaming=True,
-                                     voice=voice, temperature=temperature, instruct=instruct)
-            ):
-                yield np.asarray(chunk, dtype=np.float32).reshape(-1), int(sr)
+        try:
+            with self.lock:
+                for chunk, sr, _t in self.model.generate_voice_clone_streaming(
+                    **self._build_kwargs(text, language, streaming=True,
+                                         voice=voice, temperature=temperature, instruct=instruct)
+                ):
+                    yield np.asarray(chunk, dtype=np.float32).reshape(-1), int(sr)
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                log.debug("gen_stream cleanup: CUDA cache emptied")
 
     def gen_full(self, text: str, language: str, voice: str = "default",
                  temperature: float = 0.9, instruct: Optional[str] = None,
                  speed: float = 1.0, pitch: float = 0.0, volume: float = 1.0
                  ) -> Tuple[np.ndarray, int]:
-        with self.lock:
-            arrays, sr = self.model.generate_voice_clone(
-                **self._build_kwargs(text, language, streaming=False,
-                                     voice=voice, temperature=temperature, instruct=instruct)
-            )
-            pcm = np.concatenate(
-                [np.asarray(a, dtype=np.float32).reshape(-1) for a in arrays]
-            ) if arrays else np.zeros(0, dtype=np.float32)
-            pcm = post_process(pcm, sr, speed=speed, pitch=pitch, volume=volume)
-            return pcm, int(sr)
+        try:
+            with self.lock:
+                arrays, sr = self.model.generate_voice_clone(
+                    **self._build_kwargs(text, language, streaming=False,
+                                         voice=voice, temperature=temperature, instruct=instruct)
+                )
+                pcm = np.concatenate(
+                    [np.asarray(a, dtype=np.float32).reshape(-1) for a in arrays]
+                ) if arrays else np.zeros(0, dtype=np.float32)
+                pcm = post_process(pcm, sr, speed=speed, pitch=pitch, volume=volume)
+                return pcm, int(sr)
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                log.debug("gen_full cleanup: CUDA cache emptied")
 
 
 M = TTSModel()
@@ -538,7 +554,7 @@ async def synthesize_stream(req: SynthReq, request: Request):
                     yield _SILENCE
                     if await request.is_disconnected():
                         cancel_event.set()
-                        log.info("stream: client disconnected (heartbeat+is_disconnected)")
+                        log.info("stream: client disconnected (heartbeat)")
                         return
                     continue
                 kind, payload = item
@@ -555,9 +571,10 @@ async def synthesize_stream(req: SynthReq, request: Request):
                     log.info("stream: client disconnected (after chunk)")
                     return
         except GeneratorExit:
-            cancel_event.set()
-            log.info("stream: client disconnected (GeneratorExit), cancelling producer")
+            log.info("stream: client disconnected (GeneratorExit)")
             raise
+        finally:
+            cancel_event.set()
 
     return StreamingResponse(
         body(), media_type="audio/wav",

@@ -32,6 +32,7 @@ WORKDIR /app
 # Create pyproject.toml and install dependencies
 COPY pyproject.toml .
 RUN uv venv && uv sync
+RUN uv pip install audiotsm --python /app/.venv/bin/python
 
 # Copy server code
 COPY server.py .
