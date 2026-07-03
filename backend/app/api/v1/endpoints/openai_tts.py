@@ -125,6 +125,7 @@ async def create_speech(request: Request):
 
         audio_gen = pipeline.generate_stream(
             text, voice=voice_id, speed=speed,
+            request=request,
             **extra_kwargs,
         )
 

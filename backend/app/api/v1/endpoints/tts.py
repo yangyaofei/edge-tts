@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException, Query, Depends
+from fastapi import APIRouter, HTTPException, Query, Depends, Request
 from fastapi.responses import StreamingResponse
 
 from app.schemas.tts import VoiceInfo, TTSRequest
@@ -89,7 +89,7 @@ async def get_voices(engine: str = Query("edge", pattern="^(edge|qwen|volcengine
 
 
 @router.post("/stream", dependencies=[Depends(verify_token)])
-async def tts_stream(request: TTSRequest):
+async def tts_stream(request: TTSRequest, http_request: Request):
     """统一 TTS 流式端点。支持 edge / volcengine / qwen。"""
     if request.engine not in EngineRegistry.available():
         raise HTTPException(
@@ -104,6 +104,7 @@ async def tts_stream(request: TTSRequest):
             voice=request.voice,
             speed=request.speed,
             use_preprocess=request.preprocess,
+            request=http_request,
         )
         return StreamingResponse(audio_gen, media_type="audio/wav")
     except Exception as e:

@@ -138,11 +138,13 @@ class TTSPipeline:
         voice: str = "default",
         speed: float = 1.0,
         use_preprocess: bool = True,
+        request=None,
         **engine_kwargs,
     ) -> AsyncGenerator[bytes, None]:
         """完整 pipeline 流式生成。
 
         Yields: WAV bytes
+        request: Starlette Request 对象，用于检测客户端断开
         engine_kwargs: 传递给 engine 的额外参数 (temperature, instruct, etc.)
         """
         processed = text
@@ -181,6 +183,13 @@ class TTSPipeline:
         for i, chunk_text in enumerate(chunks):
             if not chunk_text.strip():
                 continue
+
+            # 客户端断开检测（httpx cancel scope 会吞掉 CancelledError，
+            # 导致 pipeline 误以为当前段正常结束，继续发新请求。
+            # 必须主动检测断开并停止。）
+            if request is not None and await request.is_disconnected():
+                logger.info(f"Pipeline: client disconnected, stopping at chunk {i}/{len(chunks)}")
+                return
 
             logger.debug(f"Pipeline chunk {i}/{len(chunks)}: {len(chunk_text)} chars")
 
