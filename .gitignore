@@ -36,6 +36,10 @@ tmp/
 
 # Research (large files, models, audio samples)
 research/
+models/
+
+# Build artifacts
+docker/qwen3-tts-server/build/
 
 # Vendored header-only libs (downloaded in Dockerfile)
 docker/qwen3-tts-server/httplib.h

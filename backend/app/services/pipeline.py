@@ -16,6 +16,90 @@ from app.services.llm_transcriber import LLMTranscriber
 logger = logging.getLogger(__name__)
 
 
+class _WavPcmExtractor:
+    """从 WAV 字节流中剥离 header，只输出纯 PCM。
+
+    用于多段拼接场景：qwen engine 每次返回完整 WAV（含 RIFF header），
+    若直接拼接，中间的 header 字节会被当作 PCM 解码产生爆音。
+    feed() 多次喂入字节：首次解析出完整 header 时返回 (fmt, 剩余PCM)，
+    之后返回 (None, data) 透传。若输入不是 WAV（如 MP3），原样透传。
+    """
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+        self._parsed = False
+        self.fmt: dict | None = None
+
+    def feed(self, data: bytes) -> tuple[dict | None, bytes]:
+        if self._parsed:
+            return None, data
+        self._buf.extend(data)
+        parsed = self._try_parse()
+        if parsed is None:
+            return None, b""
+        fmt, pcm_offset = parsed
+        self.fmt = fmt
+        self._parsed = True
+        remaining = bytes(self._buf[pcm_offset:])
+        self._buf = bytearray()
+        return fmt, remaining
+
+    def _try_parse(self) -> tuple[dict, int] | None:
+        buf = self._buf
+        if len(buf) < 12:
+            return None
+        if buf[0:4] != b"RIFF" or buf[8:12] != b"WAVE":
+            return ({}, 0)
+        fmt: dict = {}
+        pos = 12
+        while pos + 8 <= len(buf):
+            chunk_id = bytes(buf[pos:pos + 4])
+            chunk_size = struct.unpack("<I", bytes(buf[pos + 4:pos + 8]))[0]
+            body_start = pos + 8
+            if chunk_id == b"fmt ":
+                if body_start + 16 > len(buf):
+                    return None
+                _af, channels, sample_rate, _br, _ba, bits = struct.unpack(
+                    "<HHIIHH", bytes(buf[body_start:body_start + 16])
+                )
+                fmt = {
+                    "sample_rate": sample_rate,
+                    "channels": channels,
+                    "sample_width": bits // 8,
+                }
+            elif chunk_id == b"data":
+                return (fmt, body_start)
+            pos = body_start + chunk_size
+            if chunk_size & 1:
+                pos += 1
+        return None
+
+
+def _build_streaming_wav_header(fmt: dict) -> bytes:
+    """构造流式 WAV header（data size = 0x7FFFFFFF，表示未知长度）。"""
+    sr = fmt.get("sample_rate", 24000)
+    channels = fmt.get("channels", 1)
+    sample_width = fmt.get("sample_width", 2)
+    bits = sample_width * 8
+    byte_rate = sr * channels * bits // 8
+    block_align = channels * bits // 8
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", 0x7FFFFFFF, b"WAVE",
+        b"fmt ", 16, 1, channels, sr, byte_rate, block_align, bits,
+        b"data", 0x7FFFFFFF,
+    )
+
+
+def _make_silence_pcm(fmt: dict, seconds: float) -> bytes:
+    """生成纯 PCM 静音（无 WAV header）。"""
+    sr = fmt.get("sample_rate", 24000)
+    channels = fmt.get("channels", 1)
+    sample_width = fmt.get("sample_width", 2)
+    n = int(seconds * sr) * channels * sample_width
+    return b"\x00" * n
+
+
 class TTSPipeline:
     """TTS 编排层：LLM转写 → 预处理 → 多音字 → 分段 → engine 合成。
 
@@ -88,8 +172,11 @@ class TTSPipeline:
             chunks = self._split_first_sentence(chunks)
 
         # 4. 逐段生成
+        # 整个输出流只含一个 WAV header（开头），后续所有段和静音都是纯 PCM。
+        # 避免每段 RIFF header 被当作 PCM 解码产生爆音（"RIFF"=0x52494646 → 大幅值样本）。
         ref_audio: bytes | None = None
-        first_chunk = True
+        wav_fmt: dict | None = None
+        header_sent = False
 
         for i, chunk_text in enumerate(chunks):
             if not chunk_text.strip():
@@ -97,42 +184,51 @@ class TTSPipeline:
 
             logger.debug(f"Pipeline chunk {i}/{len(chunks)}: {len(chunk_text)} chars")
 
-            # 对 qwen engine 使用流式接口（server 内部按句子流式）
             if hasattr(self.engine, 'generate_chunk_stream'):
-                # 流式：直接 yield 每个数据块，首字延迟最低
-                if first_chunk:
-                    # 首段收集完整音频用于提取 ref
-                    audio_parts: list[bytes] = []
-                    async for data in self.engine.generate_chunk_stream(
-                        chunk_text, voice=voice, speed=speed, ref_audio=ref_audio,
-                        **engine_kwargs,
-                    ):
-                        audio_parts.append(data)
-                        yield data
-                    first_chunk_audio = b"".join(audio_parts)
-                    if len(chunks) > 1:
-                        ref_audio = self._extract_ref(first_chunk_audio, self.ref_trim_seconds)
-                else:
-                    if self.silence_between_chunks > 0:
-                        yield self._make_silence_from_engine(ref_audio, self.silence_between_chunks)
-                    async for data in self.engine.generate_chunk_stream(
-                        chunk_text, voice=voice, speed=speed, ref_audio=ref_audio,
-                        **engine_kwargs,
-                    ):
-                        yield data
+                # 流式 engine（qwen）：每次返回完整 WAV，需剥离 header
+                extractor = _WavPcmExtractor()
+                need_ref = i == 0 and len(chunks) > 1
+                chunk_pcm_parts: list[bytes] = [] if need_ref else None
+
+                # 段间静音（纯 PCM，用首段解析出的格式）
+                if i > 0 and self.silence_between_chunks > 0 and wav_fmt is not None:
+                    yield _make_silence_pcm(wav_fmt, self.silence_between_chunks)
+
+                async for data in self.engine.generate_chunk_stream(
+                    chunk_text, voice=voice, speed=speed, ref_audio=ref_audio,
+                    **engine_kwargs,
+                ):
+                    fmt, pcm = extractor.feed(data)
+                    # 首次解析出 WAV header → 发送流式 header（仅一次）
+                    if fmt is not None and not header_sent:
+                        wav_fmt = fmt or {
+                            "sample_rate": self.sample_rate,
+                            "channels": 1,
+                            "sample_width": 2,
+                        }
+                        yield _build_streaming_wav_header(wav_fmt)
+                        header_sent = True
+                    if pcm:
+                        yield pcm
+                        if chunk_pcm_parts is not None:
+                            chunk_pcm_parts.append(pcm)
+
+                # 用首段 PCM 构造 ref_audio（声音克隆一致性，engine 可选支持）
+                if need_ref and chunk_pcm_parts and wav_fmt:
+                    ref_audio = self._build_wav_from_pcm(
+                        b"".join(chunk_pcm_parts), wav_fmt,
+                    )
             else:
-                # 非流式 engine（edge/volcengine）：等完整音频
+                # 非流式 engine（edge/volcengine，返回 MP3）：拼接 MP3 帧无爆音
                 audio = await self.engine.generate_chunk(
                     chunk_text, voice=voice, speed=speed, ref_audio=ref_audio,
                 )
-                if first_chunk and len(chunks) > 1:
+                if i == 0 and len(chunks) > 1:
                     ref_audio = self._extract_ref(audio, self.ref_trim_seconds)
-                if not first_chunk and self.silence_between_chunks > 0:
+                if i > 0 and self.silence_between_chunks > 0:
                     yield self._make_silence(audio, self.silence_between_chunks)
                 else:
                     yield audio
-
-            first_chunk = False
 
     def _split_first_sentence(self, chunks: list[str]) -> list[str]:
         """将第一段拆为 [第一句, 剩余部分, ...其他段]，降低首字延迟。"""
@@ -194,3 +290,13 @@ class TTSPipeline:
         # 默认格式：16-bit PCM mono 24kHz
         n_samples = int(seconds * self.sample_rate)
         return b"\x00" * (n_samples * 2)  # int16 = 2 bytes/sample
+
+    def _build_wav_from_pcm(self, pcm: bytes, fmt: dict) -> bytes:
+        """用纯 PCM + 格式信息构造完整 WAV bytes（用于 ref_audio）。"""
+        out_buf = io.BytesIO()
+        with wave.open(out_buf, "wb") as out_wav:
+            out_wav.setnchannels(fmt.get("channels", 1))
+            out_wav.setsampwidth(fmt.get("sample_width", 2))
+            out_wav.setframerate(fmt.get("sample_rate", self.sample_rate))
+            out_wav.writeframes(pcm)
+        return out_buf.getvalue()
