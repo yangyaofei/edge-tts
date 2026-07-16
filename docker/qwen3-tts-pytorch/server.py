@@ -143,24 +143,29 @@ def speed_change(pcm: np.ndarray, sr: int, speed: float) -> np.ndarray:
 
 
 class StreamingTSM:
-    """Streaming time-scale modification via WSOLA.
+    """Streaming time-scale modification via WSOLA with accumulation buffer.
 
-    Purpose: process speed change incrementally without buffering an entire
-    sentence.  audiotsm's WSOLA object maintains internal overlap/search
-    buffers between run() calls, so feeding small PCM chunks produces
-    continuous, artifact-free output.
+    Purpose: process speed change without buffering an entire sentence,
+    while avoiding the per-chunk boundary artifacts that occur when WSOLA
+    processes very small inputs.
+
+    Strategy: accumulate incoming PCM chunks into an internal buffer.
+    Only when the buffer reaches ``accumulate_samples`` (default: 2 s of
+    audio at 24 kHz = 48 000 samples) do we run WSOLA on the batch.
+    This reduces the number of WSOLA boundary crossings by ~3-6x
+    compared to per-chunk processing, eliminating the "buzzing" artifacts.
 
     Usage:
-        tsm = StreamingTSM(speed=1.5)
+        tsm = StreamingTSM(speed=1.5, sample_rate=24000)
         for chunk in model_stream:
-            out = tsm.process(chunk)   # may be empty if WSOLA is buffering
+            out = tsm.process(chunk)   # may be empty while accumulating
             if len(out):
                 send(out)
-        tail = tsm.flush()             # drain remaining overlap
+        tail = tsm.flush()             # drain remaining buffer
     """
 
-    def __init__(self, speed: float):
-        self._speed = speed
+    def __init__(self, speed: float, sample_rate: int = 24000,
+                 buffer_secs: float = 2.0):
         self._tsm = None
         if abs(speed - 1.0) >= 0.01:
             from audiotsm import wsola
@@ -168,22 +173,40 @@ class StreamingTSM:
             self._tsm = wsola(1, speed=speed)
             self._ArrayReader = ArrayReader
             self._ArrayWriter = ArrayWriter
+        self._accumulate_samples = int(sample_rate * buffer_secs)
+        self._buf: list[np.ndarray] = []
+        self._buf_len = 0
 
-    def process(self, pcm: np.ndarray) -> np.ndarray:
-        """Feed one PCM chunk, return time-stretched output (possibly empty)."""
-        if self._tsm is None:
-            return pcm
-        if len(pcm) == 0:
+    def _drain(self) -> np.ndarray:
+        """Run WSOLA on all accumulated data and return output."""
+        if not self._buf or self._buf_len == 0 or self._tsm is None:
+            self._buf.clear()
+            self._buf_len = 0
             return np.zeros(0, dtype=np.float32)
-        reader = self._ArrayReader(pcm.reshape(1, -1).astype(np.float32))
+        full = np.concatenate(self._buf) if len(self._buf) > 1 else self._buf[0]
+        self._buf.clear()
+        self._buf_len = 0
+        reader = self._ArrayReader(full.reshape(1, -1).astype(np.float32))
         writer = self._ArrayWriter(channels=1)
         self._tsm.run(reader, writer)
         out = writer.data[0]
         return out if out is not None and len(out) > 0 else np.zeros(0, dtype=np.float32)
 
-    def flush(self) -> np.ndarray:
-        """No explicit flush needed — audiotsm empties output buffer in run()."""
+    def process(self, pcm: np.ndarray) -> np.ndarray:
+        """Accumulate PCM; run WSOLA when buffer is large enough."""
+        if self._tsm is None:
+            return pcm
+        if len(pcm) == 0:
+            return np.zeros(0, dtype=np.float32)
+        self._buf.append(pcm)
+        self._buf_len += len(pcm)
+        if self._buf_len >= self._accumulate_samples:
+            return self._drain()
         return np.zeros(0, dtype=np.float32)
+
+    def flush(self) -> np.ndarray:
+        """Drain any remaining buffered data through WSOLA."""
+        return self._drain()
 
 
 def pitch_change(pcm: np.ndarray, sr: int, n_semitones: float) -> np.ndarray:
@@ -564,7 +587,7 @@ async def synthesize_stream(req: SynthReq, request: Request):
                                 break
                     elif needs_stream:
                         # Streaming path: WSOLA + volume per chunk
-                        tsm = StreamingTSM(speed) if needs_speed else None
+                        tsm = StreamingTSM(speed, sample_rate=M.sr) if needs_speed else None
                         for pcm, sr in gen:
                             if cancel_event.is_set():
                                 break
