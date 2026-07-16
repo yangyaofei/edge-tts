@@ -142,6 +142,50 @@ def speed_change(pcm: np.ndarray, sr: int, speed: float) -> np.ndarray:
     return writer.data[0]
 
 
+class StreamingTSM:
+    """Streaming time-scale modification via WSOLA.
+
+    Purpose: process speed change incrementally without buffering an entire
+    sentence.  audiotsm's WSOLA object maintains internal overlap/search
+    buffers between run() calls, so feeding small PCM chunks produces
+    continuous, artifact-free output.
+
+    Usage:
+        tsm = StreamingTSM(speed=1.5)
+        for chunk in model_stream:
+            out = tsm.process(chunk)   # may be empty if WSOLA is buffering
+            if len(out):
+                send(out)
+        tail = tsm.flush()             # drain remaining overlap
+    """
+
+    def __init__(self, speed: float):
+        self._speed = speed
+        self._tsm = None
+        if abs(speed - 1.0) >= 0.01:
+            from audiotsm import wsola
+            from audiotsm.io.array import ArrayReader, ArrayWriter
+            self._tsm = wsola(1, speed=speed)
+            self._ArrayReader = ArrayReader
+            self._ArrayWriter = ArrayWriter
+
+    def process(self, pcm: np.ndarray) -> np.ndarray:
+        """Feed one PCM chunk, return time-stretched output (possibly empty)."""
+        if self._tsm is None:
+            return pcm
+        if len(pcm) == 0:
+            return np.zeros(0, dtype=np.float32)
+        reader = self._ArrayReader(pcm.reshape(1, -1).astype(np.float32))
+        writer = self._ArrayWriter(channels=1)
+        self._tsm.run(reader, writer)
+        out = writer.data[0]
+        return out if out is not None and len(out) > 0 else np.zeros(0, dtype=np.float32)
+
+    def flush(self) -> np.ndarray:
+        """No explicit flush needed — audiotsm empties output buffer in run()."""
+        return np.zeros(0, dtype=np.float32)
+
+
 def pitch_change(pcm: np.ndarray, sr: int, n_semitones: float) -> np.ndarray:
     """Pitch-shift: n_semitones>0 = higher, tempo preserved. Uses librosa."""
     if abs(n_semitones) < 0.01:
@@ -474,7 +518,11 @@ async def synthesize_stream(req: SynthReq, request: Request):
     cancel_event = threading.Event()
     _DONE = ("done", None)
     _ERR = ("error", None)
-    needs_post = (abs(speed - 1.0) >= 0.01 or abs(pitch) >= 0.01 or abs(volume - 1.0) >= 0.01)
+    needs_pitch  = abs(pitch) >= 0.01
+    needs_speed  = abs(speed - 1.0) >= 0.01
+    needs_volume = abs(volume - 1.0) >= 0.01
+    needs_batch  = needs_pitch                       # pitch_shift requires full signal
+    needs_stream  = (needs_speed or needs_volume) and not needs_batch
 
     def producer():
         t0 = time.perf_counter()
@@ -500,7 +548,8 @@ async def synthesize_stream(req: SynthReq, request: Request):
                     break
                 with closing(M.gen_stream(s, lang, voice=voice,
                                           temperature=temperature, instruct=instruct)) as gen:
-                    if needs_post:
+                    if needs_batch:
+                        # Batch path: pitch_shift needs the complete sentence
                         sent_chunks = []
                         for pcm, sr in gen:
                             if cancel_event.is_set():
@@ -513,7 +562,31 @@ async def synthesize_stream(req: SynthReq, request: Request):
                             total_samples += len(full)
                             if not _safe_put(("audio", (pcm_to_i16_bytes(full), sr_out))):
                                 break
+                    elif needs_stream:
+                        # Streaming path: WSOLA + volume per chunk
+                        tsm = StreamingTSM(speed) if needs_speed else None
+                        for pcm, sr in gen:
+                            if cancel_event.is_set():
+                                break
+                            sr_out = sr
+                            if tsm:
+                                pcm = tsm.process(pcm)
+                            if needs_volume:
+                                pcm = volume_change(pcm, volume)
+                            if len(pcm) > 0:
+                                total_samples += len(pcm)
+                                if not _safe_put(("audio", (pcm_to_i16_bytes(pcm), sr))):
+                                    break
+                        # Drain any remaining WSOLA overlap at sentence end
+                        if tsm and not cancel_event.is_set():
+                            tail = tsm.flush()
+                            if len(tail) > 0:
+                                if needs_volume:
+                                    tail = volume_change(tail, volume)
+                                total_samples += len(tail)
+                                _safe_put(("audio", (pcm_to_i16_bytes(tail), sr_out)))
                     else:
+                        # Pure passthrough — no DSP
                         for pcm, sr in gen:
                             if cancel_event.is_set():
                                 break
