@@ -143,70 +143,116 @@ def speed_change(pcm: np.ndarray, sr: int, speed: float) -> np.ndarray:
 
 
 class StreamingTSM:
-    """Streaming time-scale modification via WSOLA with accumulation buffer.
+    """Streaming time-scale modification via WSOLA with input overlap.
 
-    Purpose: process speed change without buffering an entire sentence,
-    while avoiding the per-chunk boundary artifacts that occur when WSOLA
-    processes very small inputs.
+    Purpose: produce artifact-free speed change while streaming, by ensuring
+    WSOLA has overlap context at every batch boundary.
 
-    Strategy: accumulate incoming PCM chunks into an internal buffer.
-    Only when the buffer reaches ``accumulate_samples`` (default: 2 s of
-    audio at 24 kHz = 48 000 samples) do we run WSOLA on the batch.
-    This reduces the number of WSOLA boundary crossings by ~3-6x
-    compared to per-chunk processing, eliminating the "buzzing" artifacts.
+    Strategy:
+      1. Accumulate incoming PCM until a batch threshold is reached.
+      2. Prepend the **input tail** from the previous batch (overlap region,
+         ~50 ms).  This gives WSOLA continuous context so the first frame
+         of each batch can find a valid overlap match.
+      3. Run WSOLA on the combined data with a **fresh** WSOLA object
+         (no stale internal state).
+      4. Discard the output samples corresponding to the overlap region.
+      5. Emit the remaining output — it connects smoothly to the previous
+         batch because WSOLA processed continuous data across the boundary.
 
-    Usage:
-        tsm = StreamingTSM(speed=1.5, sample_rate=24000)
-        for chunk in model_stream:
-            out = tsm.process(chunk)   # may be empty while accumulating
-            if len(out):
-                send(out)
-        tail = tsm.flush()             # drain remaining buffer
+    The overlap is 50 ms (≈1 200 samples at 24 kHz), well above WSOLA's
+    default frame_size (512) + search_area (256) = 768 samples.  Only a
+    few dozen ms of latency is added per batch.
     """
 
     def __init__(self, speed: float, sample_rate: int = 24000,
-                 buffer_secs: float = 2.0):
-        self._tsm = None
-        if abs(speed - 1.0) >= 0.01:
-            from audiotsm import wsola
-            from audiotsm.io.array import ArrayReader, ArrayWriter
-            self._tsm = wsola(1, speed=speed)
-            self._ArrayReader = ArrayReader
-            self._ArrayWriter = ArrayWriter
-        self._accumulate_samples = int(sample_rate * buffer_secs)
+                 buffer_secs: float = 2.0, overlap_ms: float = 100):
+        self._speed = speed
+        self._sr = sample_rate
+        self._batch_samples = int(sample_rate * buffer_secs)
+        self._overlap = int(sample_rate * overlap_ms / 1000)
         self._buf: list[np.ndarray] = []
         self._buf_len = 0
+        self._prev_tail: np.ndarray | None = None
+        self._active = abs(speed - 1.0) >= 0.01
+        if self._active:
+            from audiotsm import wsola
+            from audiotsm.io.array import ArrayReader, ArrayWriter
+            self._wsola_cls = wsola
+            self._ArrayReader = ArrayReader
+            self._ArrayWriter = ArrayWriter
 
-    def _drain(self) -> np.ndarray:
-        """Run WSOLA on all accumulated data and return output."""
-        if not self._buf or self._buf_len == 0 or self._tsm is None:
-            self._buf.clear()
-            self._buf_len = 0
-            return np.zeros(0, dtype=np.float32)
-        full = np.concatenate(self._buf) if len(self._buf) > 1 else self._buf[0]
-        self._buf.clear()
-        self._buf_len = 0
-        reader = self._ArrayReader(full.reshape(1, -1).astype(np.float32))
+    def _wsola_once(self, data: np.ndarray) -> np.ndarray:
+        """Run a fresh WSOLA object on *data* and return the output."""
+        tsm = self._wsola_cls(1, speed=self._speed)
+        reader = self._ArrayReader(data.reshape(1, -1).astype(np.float32))
         writer = self._ArrayWriter(channels=1)
-        self._tsm.run(reader, writer)
+        tsm.run(reader, writer)
         out = writer.data[0]
         return out if out is not None and len(out) > 0 else np.zeros(0, dtype=np.float32)
 
     def process(self, pcm: np.ndarray) -> np.ndarray:
-        """Accumulate PCM; run WSOLA when buffer is large enough."""
-        if self._tsm is None:
+        """Accumulate PCM; run WSOLA when buffer reaches batch threshold."""
+        if not self._active:
             return pcm
         if len(pcm) == 0:
             return np.zeros(0, dtype=np.float32)
+
         self._buf.append(pcm)
         self._buf_len += len(pcm)
-        if self._buf_len >= self._accumulate_samples:
-            return self._drain()
-        return np.zeros(0, dtype=np.float32)
+
+        if self._buf_len < self._batch_samples:
+            return np.zeros(0, dtype=np.float32)
+
+        # --- extract accumulated data ---
+        data = np.concatenate(self._buf) if len(self._buf) > 1 else self._buf[0]
+        self._buf = []
+        self._buf_len = 0
+
+        # --- save input tail for next batch's overlap ---
+        tail = data[-self._overlap:] if len(data) > self._overlap else data
+        tail = tail.copy()
+
+        # --- prepend previous overlap ---
+        prev_len = len(self._prev_tail) if self._prev_tail is not None else 0
+        if self._prev_tail is not None:
+            full = np.concatenate([self._prev_tail, data])
+        else:
+            full = data
+        self._prev_tail = tail
+
+        # --- run WSOLA on continuous data ---
+        output = self._wsola_once(full)
+
+        # --- discard head (overlap region + startup artifacts) ---
+        if prev_len > 0 and len(output) > 1:
+            skip = min(int(prev_len / self._speed), len(output) - 1)
+            output = output[skip:]
+
+        return output
 
     def flush(self) -> np.ndarray:
-        """Drain any remaining buffered data through WSOLA."""
-        return self._drain()
+        """Process any remaining buffered data."""
+        if not self._active or self._buf_len == 0:
+            self._buf.clear()
+            self._buf_len = 0
+            return np.zeros(0, dtype=np.float32)
+
+        data = np.concatenate(self._buf) if len(self._buf) > 1 else self._buf[0]
+        self._buf.clear()
+        self._buf_len = 0
+
+        prev_len = len(self._prev_tail) if self._prev_tail is not None else 0
+        if self._prev_tail is not None:
+            full = np.concatenate([self._prev_tail, data])
+        else:
+            full = data
+        self._prev_tail = None
+
+        output = self._wsola_once(full)
+        if prev_len > 0 and len(output) > 1:
+            skip = min(int(prev_len / self._speed), len(output) - 1)
+            output = output[skip:]
+        return output
 
 
 def pitch_change(pcm: np.ndarray, sr: int, n_semitones: float) -> np.ndarray:
