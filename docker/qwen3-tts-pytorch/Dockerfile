@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         libsndfile1 \
         ca-certificates \
+        build-essential \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
         python3.12 \
@@ -29,13 +30,20 @@ ENV PATH="/root/.local/bin:$PATH"
 
 WORKDIR /app
 
+# Compile Sonic C library for streaming TSM (PICOLA, artifact-free speed change)
+RUN curl -sSL -o /tmp/sonic.c https://raw.githubusercontent.com/waywardgeek/sonic/master/sonic.c \
+    && curl -sSL -o /tmp/sonic.h https://raw.githubusercontent.com/waywardgeek/sonic/master/sonic.h \
+    && gcc -O2 -fPIC -shared -o /app/libsonic.so /tmp/sonic.c -I/tmp -lm \
+    && rm /tmp/sonic.c /tmp/sonic.h
+ENV TSM_SONIC_LIB=/app/libsonic.so
+
 # Create pyproject.toml and install dependencies
 COPY pyproject.toml .
 RUN uv venv && uv sync
 RUN uv pip install audiotsm --python /app/.venv/bin/python
 
 # Copy server code
-COPY server.py .
+COPY server.py tsm_sonic.py ./
 
 # Generate a minimal reference audio for speaker embedding extraction
 RUN uv run python -c "import numpy as np, wave; sr=24000; t=np.linspace(0,3,int(sr*3),endpoint=False); a=(np.sin(2*np.pi*220*t)*0.3*32767).astype(np.int16); w=wave.open('ref_audio.wav','w'); w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr); w.writeframes(a.tobytes()); w.close(); print('ref_audio.wav ok')"

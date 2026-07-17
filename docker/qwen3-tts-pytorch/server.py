@@ -255,6 +255,28 @@ class StreamingTSM:
         return output
 
 
+def make_streaming_tsm(speed: float, sample_rate: int = 24000):
+    """Factory: prefer Sonic (true streaming, artifact-free), fall back to
+    audiotsm-based StreamingTSM if the native lib is unavailable.
+
+    Both expose the same interface: process(pcm)->ndarray, flush()->ndarray.
+    Sonic eliminates batch-boundary click/pop (single stateful stream); the
+    audiotsm fallback keeps the old overlap-hack behavior.
+    """
+    if abs(speed - 1.0) < 0.01:
+        return None
+    try:
+        from tsm_sonic import SonicTSM
+        tsm = SonicTSM(speed, sample_rate=sample_rate)
+        if tsm.available:
+            log.info("streaming TSM: Sonic backend (speed=%.2f)", speed)
+            return tsm
+        log.warning("streaming TSM: Sonic unavailable, falling back to audiotsm WSOLA")
+    except Exception as e:
+        log.warning("streaming TSM: Sonic import failed (%s), falling back to audiotsm", e)
+    return StreamingTSM(speed, sample_rate=sample_rate)
+
+
 def pitch_change(pcm: np.ndarray, sr: int, n_semitones: float) -> np.ndarray:
     """Pitch-shift: n_semitones>0 = higher, tempo preserved. Uses librosa."""
     if abs(n_semitones) < 0.01:
@@ -633,7 +655,7 @@ async def synthesize_stream(req: SynthReq, request: Request):
                                 break
                     elif needs_stream:
                         # Streaming path: WSOLA + volume per chunk
-                        tsm = StreamingTSM(speed, sample_rate=M.sr) if needs_speed else None
+                        tsm = make_streaming_tsm(speed, sample_rate=M.sr) if needs_speed else None
                         for pcm, sr in gen:
                             if cancel_event.is_set():
                                 break
