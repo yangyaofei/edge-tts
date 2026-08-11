@@ -3,6 +3,37 @@ from __future__ import annotations
 import re
 
 
+def split_sentences(text: str, min_len: int = 4) -> list[str]:
+    """按标点/换行分句, **完整保留所有字符**, 拼接结果恒等于输入文本。
+
+    目的 (purpose): 给 /segment 接口提供确定性的句子边界, 让前端能做
+    original↔tts_text 逐句对齐和 DOM 高亮 (original 拼起来 == 原文)。
+    做法 (how): lookbehind 切分 (不消费分隔符), 短句向下合并到 min_len。
+    与 TextChunker 的区别: TextChunker 的 sentence 策略会吃掉分隔符
+    (拼接丢失原文), 这里保留。
+
+    不对段做 strip —— 否则换行/空白会丢失, 破坏 "拼接 == 原文" 的不变量。
+    空白处理交给调用方 (前端 DOM / TTS 引擎各自 normalize)。
+    """
+    if not text:
+        return []
+    if not text.strip():
+        return []
+    parts = re.split(r"(?<=[。！？!?；;\n])", text)
+    out: list[str] = []
+    buf = ""
+    for p in parts:
+        if p == "":
+            continue
+        buf = p if not buf else buf + p
+        if len(buf) >= min_len:
+            out.append(buf)
+            buf = ""
+    if buf:
+        out.append(buf)
+    return out if out else [text]
+
+
 class TextChunker:
     """通用文本分段器。支持段落、句子、固定字符数三种策略。"""
 

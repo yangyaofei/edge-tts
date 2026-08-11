@@ -39,6 +39,7 @@ class LLMTranscriber:
         prompt: str = DEFAULT_PROMPT,
         timeout: float = 60.0,
         max_tokens: int = 8192,
+        raise_on_error: bool = False,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
@@ -46,6 +47,7 @@ class LLMTranscriber:
         self.prompt = prompt
         self.timeout = timeout
         self.max_tokens = max_tokens
+        self.raise_on_error = raise_on_error
 
     def is_configured(self) -> bool:
         """是否已配置可用。"""
@@ -96,4 +98,6 @@ class LLMTranscriber:
                 return result
         except Exception as e:
             logger.error(f"LLM transcribe failed: {e}, returning original text")
+            if self.raise_on_error:
+                raise
             return text
