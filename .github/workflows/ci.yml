@@ -63,7 +63,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install ruff
-        run: pip install ruff
+        run: pip install ruff==0.16.2
 
       - name: Lint server.py
         run: ruff check docker/qwen3-tts-pytorch/server.py

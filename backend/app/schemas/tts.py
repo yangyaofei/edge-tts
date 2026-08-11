@@ -56,3 +56,20 @@ OPENAI_AUDIO_CONTENT_TYPES = {
     "wav": "audio/wav",
     "pcm": "audio/pcm",
 }
+
+
+class SegmentRequest(BaseModel):
+    text: str
+    language: str = "zh"
+    normalize: str = "llm"          # none | rule | llm
+
+
+class SegmentSentence(BaseModel):
+    index: int
+    original: str
+    tts_text: str
+    source: str                      # llm | rule | none
+
+
+class SegmentResponse(BaseModel):
+    sentences: List[SegmentSentence]

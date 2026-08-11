@@ -86,6 +86,9 @@ class Settings(BaseSettings):
     TTS_LLM_TRANSCRIBE_API_URL: str = ""        # OpenAI-compatible endpoint
     TTS_LLM_TRANSCRIBE_API_KEY: str = ""
     TTS_LLM_TRANSCRIBE_MODEL: str = "gpt-4o-mini"
+    # segment 接口并发/超时（逐句并发调用 LLM）
+    TTS_LLM_CONCURRENCY: int = 8
+    TTS_LLM_TIMEOUT: float = 15.0
 
     class Config:
         case_sensitive = True

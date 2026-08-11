@@ -1,18 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException, Query, Depends, Request
 from fastapi.responses import StreamingResponse
 
-from app.schemas.tts import VoiceInfo, TTSRequest
+from app.schemas.tts import VoiceInfo, TTSRequest, SegmentRequest, SegmentSentence, SegmentResponse
 from app.core.security import verify_token
 from app.core.config import settings
 from app.services.registry import EngineRegistry, register_builtin_engines
 from app.services.pipeline import TTSPipeline
 from app.services.text_preprocessor import TextPreprocessor
 from app.services.polyphone import PolyphoneFixer
-from app.services.chunker import TextChunker
+from app.services.chunker import TextChunker, split_sentences
 from app.services.llm_transcriber import LLMTranscriber
 
 logger = logging.getLogger(__name__)
@@ -117,3 +118,79 @@ async def edge_tts_stream(request: TTSRequest):
     """向后兼容端点。"""
     request.engine = "edge"
     return await tts_stream(request)
+
+
+# ---------- /segment: 分句 + 归一化 (纯文本预处理, 不碰音频) ----------
+
+# 模块级单例: 规则归一化无状态, 复用一个; LLM transcriber 按 endpoint 配置构建。
+_PREPROCESSOR = TextPreprocessor()
+
+
+def _build_segment_llm() -> LLMTranscriber | None:
+    """构建 segment 专用的 LLM transcriber。
+
+    与 _build_pipeline() 不同: 这里 raise_on_error=True —— 失败时抛异常
+    而不是静默返回原文, 让 endpoint 能精确降级到 rule (source 可见)。
+    """
+    if not settings.TTS_LLM_TRANSCRIBE_ENABLED:
+        return None
+    if not (settings.TTS_LLM_TRANSCRIBE_API_URL and settings.TTS_LLM_TRANSCRIBE_API_KEY):
+        return None
+    return LLMTranscriber(
+        api_url=settings.TTS_LLM_TRANSCRIBE_API_URL,
+        api_key=settings.TTS_LLM_TRANSCRIBE_API_KEY,
+        model=settings.TTS_LLM_TRANSCRIBE_MODEL,
+        raise_on_error=True,
+        timeout=settings.TTS_LLM_TIMEOUT,
+    )
+
+
+@router.post("/segment", response_model=SegmentResponse, dependencies=[Depends(verify_token)])
+async def tts_segment(request: SegmentRequest):
+    """分句 + 归一化。返回逐句 original/tts_text, original 拼接 == 输入原文。
+
+    normalize:
+      - none: 不归一化, tts_text == original
+      - rule: TextPreprocessor (本地正则)
+      - llm:  LLMTranscriber 逐句并发, 单句失败降级 rule
+    """
+    text = (request.text or "").strip()
+    if not text:
+        return SegmentResponse(sentences=[])
+
+    mode = request.normalize
+    if mode not in ("none", "rule", "llm"):
+        raise HTTPException(status_code=400, detail=f"normalize must be none|rule|llm, got {mode!r}")
+
+    originals = split_sentences(text, min_len=4)
+    if not originals:
+        return SegmentResponse(sentences=[])
+
+    llm = _build_segment_llm() if mode == "llm" else None
+    sem = asyncio.Semaphore(settings.TTS_LLM_CONCURRENCY)
+
+    async def normalize_one(sentence: str) -> tuple[str, str]:
+        """单句归一化, 返回 (tts_text, source)。"""
+        if mode == "none":
+            return sentence, "none"
+        if mode == "rule" or llm is None:
+            return _PREPROCESSOR.process(sentence), "rule"
+        # mode == "llm"
+        try:
+            async with sem:
+                tts_text = await asyncio.wait_for(llm.transcribe(sentence), timeout=settings.TTS_LLM_TIMEOUT)
+            tts_text = (tts_text or "").strip()
+            if not tts_text:
+                raise ValueError("LLM returned empty text")
+            return tts_text, "llm"
+        except Exception as e:
+            logger.warning(f"segment LLM normalize failed, fallback to rule: {e}")
+            return _PREPROCESSOR.process(sentence), "rule"
+
+    results = await asyncio.gather(*(normalize_one(s) for s in originals))
+
+    sentences = [
+        SegmentSentence(index=i, original=orig, tts_text=tts, source=src)
+        for i, (orig, (tts, src)) in enumerate(zip(originals, results))
+    ]
+    return SegmentResponse(sentences=sentences)

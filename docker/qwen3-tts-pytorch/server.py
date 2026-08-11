@@ -19,21 +19,21 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
 import struct
 import threading
 import time
+from collections.abc import Generator
 from contextlib import asynccontextmanager, closing
 from pathlib import Path
-from queue import Queue, Full, Empty
-from typing import Generator, List, Optional, Tuple
+from queue import Empty, Full, Queue
 
-import asyncio
 import numpy as np
 import torch
-from fastapi import FastAPI, UploadFile, File, Request
+from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
@@ -76,19 +76,19 @@ _VALID_LANGS = {
 }
 
 
-def normalize_language(lang: Optional[str]) -> str:
+def normalize_language(lang: str | None) -> str:
     if not lang:
         return "chinese"
     k = lang.strip().lower()
     return _LANG_ALIAS.get(k, k)
 
 
-def split_sentences(text: str, min_len: int = 4) -> List[str]:
+def split_sentences(text: str, min_len: int = 4) -> list[str]:
     text = (text or "").strip()
     if not text:
         return []
     parts = re.split(r"(?<=[。！？!?；;\n])", text)
-    out: List[str] = []
+    out: list[str] = []
     buf = ""
     for p in parts:
         p = p.strip()
@@ -111,7 +111,7 @@ def pcm_to_i16_bytes(x: np.ndarray) -> bytes:
     return (x * 32767.0).astype("<i2").tobytes()
 
 
-def wav_header(sr: int, channels: int = 1, bits: int = 16, n_frames: Optional[int] = None) -> bytes:
+def wav_header(sr: int, channels: int = 1, bits: int = 16, n_frames: int | None = None) -> bytes:
     byte_rate = sr * channels * bits // 8
     block_align = channels * bits // 8
     data_sz = 0x7FFFFFFF if n_frames is None else n_frames * block_align
@@ -272,7 +272,7 @@ def make_streaming_tsm(speed: float, sample_rate: int = 24000):
             log.info("streaming TSM: Sonic backend (speed=%.2f)", speed)
             return tsm
         log.warning("streaming TSM: Sonic unavailable, falling back to audiotsm WSOLA")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         log.warning("streaming TSM: Sonic import failed (%s), falling back to audiotsm", e)
     return StreamingTSM(speed, sample_rate=sample_rate)
 
@@ -330,7 +330,7 @@ class TTSModel:
             self.lang_set = set(
                 self.model.model.model.config.talker_config.codec_language_id.keys()
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             self.lang_set = _VALID_LANGS
         log.info(
             "model loaded %.1fs  sr=%d  VRAM=%.2fGB  langs=%d",
@@ -406,7 +406,7 @@ class TTSModel:
                     ref_audio=ref_audio, ref_text=ref_text, x_vector_only_mode=False
                 )
                 return items
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             log.warning("compute prompt failed for %s: %s", ref_audio, e)
             return None
 
@@ -422,19 +422,19 @@ class TTSModel:
             log.info("warmup ok %.1fs  chunks=%d  peakVRAM=%.2fGB",
                      time.perf_counter() - t0, n,
                      torch.cuda.max_memory_allocated() / 1e9)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             log.warning("warmup failed: %s", e)
 
     def _build_kwargs(self, text: str, language: str, streaming: bool,
                       voice: str = "default", temperature: float = 0.9,
-                      instruct: Optional[str] = None) -> dict:
-        kw = dict(
-            text=text, language=language, xvec_only=XVEC_ONLY,
-            max_new_tokens=MAX_NEW_TOKENS,
-            ref_text="" if XVEC_ONLY else REF_TEXT,
-            temperature=temperature,
-            instruct=instruct,
-        )
+                      instruct: str | None = None) -> dict:
+        kw = {
+            "text": text, "language": language, "xvec_only": XVEC_ONLY,
+            "max_new_tokens": MAX_NEW_TOKENS,
+            "ref_text": "" if XVEC_ONLY else REF_TEXT,
+            "temperature": temperature,
+            "instruct": instruct,
+        }
         if streaming:
             kw["chunk_size"] = CHUNK_SIZE
 
@@ -447,8 +447,8 @@ class TTSModel:
         return kw
 
     def gen_stream(self, text: str, language: str, voice: str = "default",
-                   temperature: float = 0.9, instruct: Optional[str] = None
-                   ) -> Generator[Tuple[np.ndarray, int], None, None]:
+                   temperature: float = 0.9, instruct: str | None = None
+                   ) -> Generator[tuple[np.ndarray, int], None, None]:
         try:
             with self.lock:
                 for chunk, sr, _t in self.model.generate_voice_clone_streaming(
@@ -463,9 +463,9 @@ class TTSModel:
                 log.debug("gen_stream cleanup: CUDA cache emptied")
 
     def gen_full(self, text: str, language: str, voice: str = "default",
-                 temperature: float = 0.9, instruct: Optional[str] = None,
+                 temperature: float = 0.9, instruct: str | None = None,
                  speed: float = 1.0, pitch: float = 0.0, volume: float = 1.0
-                 ) -> Tuple[np.ndarray, int]:
+                 ) -> tuple[np.ndarray, int]:
         try:
             with self.lock:
                 arrays, sr = self.model.generate_voice_clone(
@@ -492,14 +492,14 @@ M = TTSModel()
 # --------------------------------------------------------------------------- #
 class SynthReq(BaseModel):
     text: str
-    language: Optional[str] = "chinese"
-    voice: Optional[str] = "default"
-    temperature: Optional[float] = 0.9
-    speed: Optional[float] = 1.0          # 1.0=原速, 1.5=快1.5倍, 0.8=慢
-    pitch: Optional[float] = 0.0          # 半音, +2=升2半音, -3=降3半音
-    volume: Optional[float] = 1.0         # 1.0=原音量, 1.5=+50%, 0.5=减半
-    instruct: Optional[str] = None        # 仅 1.7B CustomVoice 有效
-    max_new_tokens: Optional[int] = None
+    language: str | None = "chinese"
+    voice: str | None = "default"
+    temperature: float | None = 0.9
+    speed: float | None = 1.0          # 1.0=原速, 1.5=快1.5倍, 0.8=慢
+    pitch: float | None = 0.0          # 半音, +2=升2半音, -3=降3半音
+    volume: float | None = 1.0         # 1.0=原音量, 1.5=+50%, 0.5=减半
+    instruct: str | None = None        # 仅 1.7B CustomVoice 有效
+    max_new_tokens: int | None = None
 
 
 @asynccontextmanager
@@ -538,7 +538,7 @@ def get_voices():
 
 
 @app.post("/api/ref_audio/{voice_id}")
-async def upload_ref_audio(voice_id: str, name: str = "", file: UploadFile = File(...)):
+async def upload_ref_audio(voice_id: str, name: str = "", file: UploadFile = File(...)):  # noqa: B008
     """Upload a reference audio file to register a new voice."""
     REF_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     save_path = REF_AUDIO_DIR / f"{voice_id}.wav"
