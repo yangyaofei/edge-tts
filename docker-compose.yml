@@ -61,3 +61,11 @@ services:
         max-size: "20m"
         max-file: "3"
     restart: unless-stopped
+    networks:
+      - default
+      - dev-net
+
+networks:
+  dev-net:
+    external: true
+    name: code-server_dev-net
