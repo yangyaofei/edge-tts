@@ -11,7 +11,7 @@ from app.core.security import verify_token
 from app.core.config import settings
 from app.services.registry import EngineRegistry, register_builtin_engines
 from app.services.pipeline import TTSPipeline
-from app.services.chunker import TextChunker, split_sentences
+from app.services.chunker import TextChunker, split_markdown
 from app.services.normalizer import normalize_sentence
 
 logger = logging.getLogger(__name__)
@@ -111,7 +111,7 @@ async def tts_split(request: SplitRequest):
     text = (request.text or "").strip()
     if not text:
         return SplitResponse(sentences=[])
-    originals = split_sentences(text, min_len=4)
+    originals = split_markdown(text)
     sentences = [SplitSentence(index=i, text=s) for i, s in enumerate(originals)]
     return SplitResponse(sentences=sentences)
 

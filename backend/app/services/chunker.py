@@ -2,19 +2,136 @@ from __future__ import annotations
 
 import re
 
+from markdown_it import MarkdownIt
+
+
+def split_markdown(text: str, max_len: int = 500, min_len: int = 30) -> list[str]:
+    """用 markdown AST 按块级元素分割, 保留原始 markdown 源码。
+
+    目的: 确定性分割 (按 markdown 语法树), 不做格式修正。
+    每个块级元素 (标题/段落/列表项/引用/表格/代码块) 成一个段落。
+    markdown 标记保留原样, 交给 normalize 阶段的 LLM 处理。
+    超长段落按句号二次分割。
+    标题段合并到后续第一个非标题段 (避免标题单独播放不流畅)。
+    非标题段落保持独立, 不互相合并。
+    """
+    if not text or not text.strip():
+        return []
+
+    # 预处理: 修复 "#\n标题文本" → "# 标题文本"
+    # 上游生成的文章把 # 和标题文本分在两行, markdown_it 会把 # 解析成空标题。
+    text = re.sub(r'^(#{1,6})\s*\n([^\n#]+)$', r'\1 \2', text, flags=re.MULTILINE)
+
+    md = MarkdownIt("commonmark")
+    tokens = md.parse(text)
+    lines = text.split("\n")
+
+    segments: list[str] = []
+    headings: list[bool] = []
+    depth = 0
+
+    for token in tokens:
+        pre_depth = depth
+        depth += token.nesting  # +1 open, -1 close, 0 self-closing
+
+        # 跳过水平线
+        if token.type == "hr":
+            continue
+
+        # 顶层自闭合块 (代码块)
+        if token.type in ("fence", "code_block") and pre_depth == 0:
+            content = token.content.strip()
+            if content:
+                segments.append(content)
+                headings.append(False)
+            continue
+
+        # 顶层块级元素: 标题/段落/引用/表格 -- 用 map 取源码
+        if (
+            token.nesting == 1
+            and pre_depth == 0
+            and token.type
+            in ("heading_open", "paragraph_open", "blockquote_open", "table_open")
+        ):
+            raw = _source_lines(lines, token.map)
+            if raw:
+                segments.append(raw)
+                headings.append(token.type == "heading_open")
+            continue
+
+        # 列表项 (depth 1, 在 list 内部) -- 每项独立
+        if token.nesting == 1 and pre_depth == 1 and token.type == "list_item_open":
+            raw = _source_lines(lines, token.map)
+            if raw:
+                segments.append(raw)
+                headings.append(False)
+            continue
+
+    # 拆超长段落 (标题不拆), 再合并标题到后续段
+    split: list[str] = []
+    split_heads: list[bool] = []
+    for seg, is_head in zip(segments, headings):
+        if len(seg) > max_len and not is_head:
+            parts = _split_long(seg, max_len)
+            split.extend(parts)
+            split_heads.extend([False] * len(parts))
+        else:
+            split.append(seg)
+            split_heads.append(is_head)
+    return _merge_headings(split, split_heads)
+
+
+def _merge_headings(segments: list[str], headings: list[bool]) -> list[str]:
+    """标题段合并到后续第一个非标题段。
+
+    段落级粒度: 非标题段落保持独立, 不互相合并。
+    连续标题累积, 遇到段落时一并合并。末尾标题独立。
+    """
+    merged: list[str] = []
+    pending: list[str] = []
+    for seg, is_head in zip(segments, headings):
+        if is_head:
+            pending.append(seg)
+        else:
+            if pending:
+                merged.append("\n".join(pending + [seg]))
+                pending = []
+            else:
+                merged.append(seg)
+    if pending:
+        merged.extend(pending)
+    return merged
+
+
+def _source_lines(lines: list[str], mapping: list[int] | None) -> str:
+    """从 token.map [start, end) 提取原始源码行。"""
+    if not mapping:
+        return ""
+    start, end = mapping
+    return "\n".join(lines[start:end]).strip()
+
+
+def _split_long(text: str, max_len: int) -> list[str]:
+    """超长段落按强句末标点(句号/感叹/问号)分割, 短句合并到 max_len 以内。
+    不在分号、换行处切割——它们是句内停顿, 切了会产生碎片。"""
+    parts = re.split(r"(?<=[。！？!?])", text)
+    result: list[str] = []
+    current = ""
+    for p in parts:
+        if not p:
+            continue
+        if len(current) + len(p) > max_len and current:
+            result.append(current.strip())
+            current = p
+        else:
+            current += p
+    if current.strip():
+        result.append(current.strip())
+    return result
+
 
 def split_sentences(text: str, min_len: int = 4) -> list[str]:
-    """按标点/换行分句, **完整保留所有字符**, 拼接结果恒等于输入文本。
-
-    目的 (purpose): 给 /segment 接口提供确定性的句子边界, 让前端能做
-    original↔tts_text 逐句对齐和 DOM 高亮 (original 拼起来 == 原文)。
-    做法 (how): lookbehind 切分 (不消费分隔符), 短句向下合并到 min_len。
-    与 TextChunker 的区别: TextChunker 的 sentence 策略会吃掉分隔符
-    (拼接丢失原文), 这里保留。
-
-    不对段做 strip —— 否则换行/空白会丢失, 破坏 "拼接 == 原文" 的不变量。
-    空白处理交给调用方 (前端 DOM / TTS 引擎各自 normalize)。
-    """
+    """按标点/换行分句 (旧接口, 保留兼容)。"""
     if not text:
         return []
     if not text.strip():
