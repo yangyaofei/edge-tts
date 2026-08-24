@@ -68,10 +68,15 @@ SYSTEM_PROMPT = """你是中文语音合成(TTS)文本归一化编辑器。你�
 - 电话/长ID (5位以上): 空格逐字, 1 读幺: 13800000000 → 幺 三 八 零 零 零 零 零 零 零 零
 - 型号里的数字同样转中文: GLM-5.3 → G L M 五点三
 
-### 2. 英文缩写与单位
-- 缩写字母逐字大写加空格: CPU → C P U; GPU → G P U
+### 2. 英文缩写与单位 (先判断读音类型, 再决定拆不拆)
+英文词分两类, 处理方式完全不同:
+- **缩读词 (acronym, 能当单词拼读)**: 保持原样不拆。YOLO/NASA/Astra/Lyte/rame/.nano
+  读作一个词 "you-low"/"na-sa"。判断方法: 元音+辅音交替、人人口语里当词说的。
+- **首字母缩写 (initialism, 逐字母拼读)**: 拆开加空格。CPU/GPU/API/URL/LLM/DRAM/ETF
+  读作 "C-P-U"/"G-P-U"。判断方法: 辅音连串、口语里逐字母念的。
+- 边界情况优先查词表 (query_lexicon), 词表是最高优先级。
 - 单位: 字母部分拆开 + 中文量词: GB → G B; GHz → G 赫兹
-- 纯英文单词保持原样: Python, DeepSeek 不拆
+- 纯英文单词/产品名保持原样: Python, DeepSeek, Claude 不拆
 - 型号: 字母部分拆开 + 版本数字转中文: Qwen-3.8 → Q w e n 三点八
 
 ### 3. 多音字 (保守!)
@@ -80,8 +85,12 @@ SYSTEM_PROMPT = """你是中文语音合成(TTS)文本归一化编辑器。你�
 - 替换形式: 拼音紧跟被替换的字, 无括号无空格: 重新 → chóng新
 - 严禁给 的/了/着/从/同/当 等虚词标音
 
-### 4. 停顿
-- 词语间需要清晰边界的位置插入空格 (分词停顿)
+### 4. 停顿 (在语义单元边界, 不拆散短语)
+- 停顿只放在语义单元边界: 状语之后、主谓之间、并列成分之间
+- 英文词/名字 + 中文助词 (里/的/中/上) 结尾的状语, 停顿放助词之后:
+  "邀请 Gemini 里 想离开的人" ✓ (Gemini 里 = 状语, 想离开 = 新谓语)
+  "邀请 Gemini 里想 离开的人" ✗ (拆散了动宾短语 想离开)
+- 动宾短语/谓语内部禁止停顿: 想离开/要做/能吃/会来 不能拆
 - 长句 (20字以上无标点) 在语义处插入逗号
 - 英文缩写与中文之间加空格
 
@@ -155,7 +164,8 @@ def _validate_edit(state: HarnessState, find: str, occurrence: int, to: str) -> 
         raise ModelRetry(f"{find!r} 是虚词/常用字, 禁止标注读音。")
     if _PINYIN_SPACE_RE.search(to):
         raise ModelRetry(f"to {to!r} 拼音之间有空格, 会被 TTS 拆开读。拼音必须紧跟汉字。")
-    if not re.search(r"[\u4e00-\u9fffA-Za-z]", to):
+    # 符号清洗 (标点→标点/markdown 去除) 合法; 只拦"无中文无字母无标点的纯异常"内容
+    if not re.search(r"[\u4e00-\u9fffA-Za-z，。！？；：、,.!?:;\"'“”‘’()\[\]（）]", to):
         raise ModelRetry(f"to {to!r} 无有效文字内容。")
 
 

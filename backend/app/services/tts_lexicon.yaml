@@ -74,6 +74,8 @@ unit:
   MW: 兆瓦
 
 model:
+  YOLO: YOLO            # 缩读词, 整体读 (you only live once), 不拆字母
+  YOLO11: YOLO 十一
   GLM-5.3: G L M 五点三
   GLM-5.2: G L M 五点二
   GLM-4.7: G L M 四点七
