@@ -77,3 +77,12 @@ class NormalizeRequest(BaseModel):
 
 class NormalizeResponse(BaseModel):
     tts_text: str
+
+
+class NormalizeBatchRequest(BaseModel):
+    sentences: List[str]
+    language: str = "chinese"
+
+
+class NormalizeBatchResponse(BaseModel):
+    results: List[str]

@@ -1,0 +1,101 @@
+# TTS 归一化词表: 约定俗成的读法 (动态注入 prompt, 命中才注入)
+# 维护规则: 发现一个错例就加一条。LLM 不可靠的读法全部固化在这里。
+#
+# polyphone: 多音字 (find 原词 → to 替换形式, 拼音紧跟需替换的字, 无括号无空格)
+#   注意: 拼音方案仅用于 LLM 无法从上下文判断的罕见场景, 高频多音词优先靠上下文
+# unit:      单位/缩写读法
+# model:     型号/产品名读法 (字母拆空格 + 数字转中文)
+
+polyphone:
+  # 只留 TTS 上下文消歧失败/歧义高危的词。上下文能读对的 (银行/音乐/成长/处理/重要等)
+  # 一律不进词表 — 标注反而引入双读风险。
+  参差: 参cēn差
+  差劲: 差chà劲
+  供不应求: gōng不yìng求
+  削弱: 削xuē弱
+  堵塞: 堵sè塞
+  塞责: sè责
+  挑衅: 挑tiǎo衅
+  提防: 提dī防
+  累计: 累lěi计
+  反省: 反xǐng省
+  拮据: 拮jū据
+  逮捕: 逮dài捕
+  症结: 症zhēng结
+  荫凉: 荫yìn凉
+  一叶扁舟: 一叶piān舟
+  压根: 压yà根
+  哈达: 哈hǎ达
+  吐蕃: 吐bō蕃
+
+unit:
+  GB: G B
+  MB: M B
+  KB: K B
+  TB: T B
+  GHz: G 赫兹
+  MHz: M 赫兹
+  THz: T 赫兹
+  Gbps: G b p s
+  Mbps: M b p s
+  Kbps: K b p s
+  ms: 毫秒
+  ns: 纳秒
+  CPU: C P U
+  GPU: G P U
+  TPU: T P U
+  NPU: N P U
+  RAM: R A M
+  ROM: R O M
+  SSD: S S D
+  HDD: H D D
+  API: A P I
+  SDK: S D K
+  URL: U R L
+  HTTP: H T T P
+  HTTPS: H T T P S
+  TCP: T C P
+  IP: I P
+  DNS: D N S
+  CDN: C D N
+  VPN: V P N
+  LLM: L L M
+  AI: A I
+  ML: M L
+  RL: R L
+  GDP: G D P
+  CEO: C E O
+  CFO: C F O
+  CTO: C T O
+  FCC: F C C
+  NASA: N A S A
+  PA: 帕
+  KW: 千瓦
+  MW: 兆瓦
+
+model:
+  GLM-5.3: G L M 五点三
+  GLM-5.2: G L M 五点二
+  GLM-4.7: G L M 四点七
+  Qwen3.8: Q w e n 三点八
+  Qwen-3.8: Q w e n 三点八
+  Qwen3.6: Q w e n 三点六
+  GPT-5.6: G P T 五点六
+  GPT-5: G P T 五
+  Claude: Claude
+  DeepSeek-V4: DeepSeek V 四
+  DeepSeek-V4-Flash: DeepSeek V四 Flash
+  DeepSeek-V4-Pro: DeepSeek V四 Pro
+  Opus-4.7: Opus 四点七
+  Sonnet-5: Sonnet 五
+  Kimi-K3: Kimi K三
+  MiniMax-M3: MiniMax M三
+  V4: V四
+  V3: V三
+  HBM5: H B M 五
+  LPDDR5X: L P D D R 五 X
+  4nm: 四纳米
+  5nm: 五纳米
+  3nm: 三纳米
+  MI500: M I 五零零
+  MI300: M I 三零零

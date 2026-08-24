@@ -112,21 +112,43 @@ def _source_lines(lines: list[str], mapping: list[int] | None) -> str:
 
 
 def _split_long(text: str, max_len: int) -> list[str]:
-    """超长段落按强句末标点(句号/感叹/问号)分割, 短句合并到 max_len 以内。
-    不在分号、换行处切割——它们是句内停顿, 切了会产生碎片。"""
-    parts = re.split(r"(?<=[。！？!?])", text)
-    result: list[str] = []
+    """超长段落拆分 — 按句边界分块, 不机械合并、不打断句子。
+
+    1. 按行累积: 行尾是句末标点(。！？!?) → 该处是块边界; 行尾无句末标点 → 续接下一行
+       (排版换行/句内换行不产生块边界, 半句不能独立成块)。
+    2. 块内超长 → 按强句末标点拆分。
+    3. 块间绝不合并 — 不允许上一块末句与下一块首句合在一起。
+    """
+    blocks: list[str] = []
     current = ""
-    for p in parts:
-        if not p:
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
             continue
-        if len(current) + len(p) > max_len and current:
-            result.append(current.strip())
-            current = p
-        else:
-            current += p
+        current += line
+        if re.search(r"[。！？!?]$", line):
+            blocks.append(current)
+            current = ""
     if current.strip():
-        result.append(current.strip())
+        blocks.append(current)
+
+    result: list[str] = []
+    for block in blocks:
+        if len(block) <= max_len:
+            result.append(block)
+            continue
+        parts = re.split(r"(?<=[。！？!?])", block)
+        current = ""
+        for p in parts:
+            if not p:
+                continue
+            if len(current) + len(p) > max_len and current:
+                result.append(current.strip())
+                current = p
+            else:
+                current += p
+        if current.strip():
+            result.append(current.strip())
     return result
 
 

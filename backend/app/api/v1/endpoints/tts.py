@@ -6,13 +6,13 @@ import logging
 from fastapi import APIRouter, HTTPException, Query, Depends, Request
 from fastapi.responses import StreamingResponse
 
-from app.schemas.tts import VoiceInfo, TTSRequest, SplitRequest, SplitSentence, SplitResponse, NormalizeRequest, NormalizeResponse
+from app.schemas.tts import VoiceInfo, TTSRequest, SplitRequest, SplitSentence, SplitResponse, NormalizeRequest, NormalizeResponse, NormalizeBatchRequest, NormalizeBatchResponse
 from app.core.security import verify_token
 from app.core.config import settings
 from app.services.registry import EngineRegistry, register_builtin_engines
 from app.services.pipeline import TTSPipeline
 from app.services.chunker import TextChunker, split_markdown
-from app.services.normalizer import normalize_sentence
+from app.services.normalize_harness import normalize_sentence
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -136,3 +136,36 @@ async def tts_normalize(request: NormalizeRequest):
     except Exception as e:
         logger.warning(f"normalize failed ({len(text)} chars), return original: {e}")
         return NormalizeResponse(tts_text=text)
+
+
+# ---------- /normalize-batch: 多句并发归一化 (前端一次请求, 后端 gather) ----------
+
+_normalize_sem = asyncio.Semaphore(8)
+
+
+async def _normalize_one(text: str) -> str:
+    """单句归一化, 失败返回原文。sem 控制并发。"""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    try:
+        async with _normalize_sem:
+            return await asyncio.wait_for(
+                normalize_sentence(t), timeout=settings.TTS_LLM_TIMEOUT
+            )
+    except Exception as e:
+        logger.warning(f"normalize failed ({len(t)} chars), return original: {e}")
+        return t
+
+
+@router.post("/normalize-batch", response_model=NormalizeBatchResponse, dependencies=[Depends(verify_token)])
+async def tts_normalize_batch(request: NormalizeBatchRequest):
+    """批量归一化。结果顺序与输入一致。单句失败降级原文。
+
+    前端一次请求归一化剩余全部句子(绕过浏览器同 host 6 连接限制),
+    后端 8 并发 gather 调 LLM。
+    """
+    if not request.sentences:
+        return NormalizeBatchResponse(results=[])
+    results = await asyncio.gather(*(_normalize_one(s) for s in request.sentences))
+    return NormalizeBatchResponse(results=results)
