@@ -50,6 +50,20 @@ _PINYIN_SPACE_RE = re.compile(
 )
 _DIGIT_RE = re.compile(r"\d+")
 
+# 确定性规则: 字母-2-字母 → 字母 to 字母 (B2B → B to B, P2P → P to P)
+# 捕获组保证 B2B2C → B to B to C (链式); M2 芯片 不误伤 (2 后无字母)
+_DIGIT_TO_RE = re.compile(r"([A-Za-z])2([A-Za-z])")
+
+
+def _deterministic_preprocess(text: str) -> str:
+    """程序侧确定性归一化 (不进 LLM): X2X 模式的 2 读 'to'。
+
+    B2B/B2C/P2P/C2C/A2A/G2B/O2O/M2M 等商业/技术术语的 2 都读 'to' (双),
+    这是纯规则, 由程序直接处理, 避免每句让 LLM 猜。
+    """
+    return _DIGIT_TO_RE.sub(r"\1 to \2", text)
+
+
 SYSTEM_PROMPT = """你是中文语音合成(TTS)文本归一化编辑器。你只提交编辑指令, 不重写全文, 程序负责应用与校验。
 
 ## 工作流程
@@ -87,6 +101,9 @@ SYSTEM_PROMPT = """你是中文语音合成(TTS)文本归一化编辑器。你�
 - 上下文能判断的常见多音词: 不处理 (银行/音乐/成长 TTS 自己会读对)
 - 只处理歧义高危词, 且必须查询词表 (query_lexicon) 获取标准替换形式
 - 其他替换形式: 拼音紧跟被替换的字, 无括号无空格: 重新 → chóng新
+- 声调必须用调号符号 (ā á ǎ à ē é ě è ī í ǐ ì ō ó ǒ ò ū ú ǔ ù ǖ ǘ ǚ ǜ),
+  严禁数字声调 (cheng4 / cheng2 都是错的) 和括号/声字标注 ((cheng) / cheng4声 都是错的)
+- 标音前必须确认正确读音 (用 query_lexicon 或词典), 标错比不标更糟
 - 严禁给 从/同/当/了/着 等虚词标音
 
 ### 4. 停顿 (语义单元粒度, 句内也要分块)
@@ -313,6 +330,7 @@ async def normalize_sentence(text: str) -> str:
     if _get_model() is None:
         return text
 
+    text = _deterministic_preprocess(text)  # 程序侧规则先跑: B2B → B to B
     state = HarnessState(original=text)
     agent = _build_agent(state)
 
