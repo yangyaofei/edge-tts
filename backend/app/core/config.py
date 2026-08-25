@@ -88,7 +88,9 @@ class Settings(BaseSettings):
     TTS_LLM_TRANSCRIBE_MODEL: str = "gpt-4o-mini"
     # segment 接口并发/超时（逐句并发调用 LLM）
     TTS_LLM_CONCURRENCY: int = 8
-    TTS_LLM_TIMEOUT: float = 15.0
+    TTS_LLM_TIMEOUT: float = 120.0
+    # DeepSeek thinking 力度: low(快,~10s/段) / high(精确,~30s/段)
+    TTS_LLM_REASONING_EFFORT: str = "low"
 
     class Config:
         case_sensitive = True

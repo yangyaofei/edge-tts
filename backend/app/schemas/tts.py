@@ -58,18 +58,31 @@ OPENAI_AUDIO_CONTENT_TYPES = {
 }
 
 
-class SegmentRequest(BaseModel):
+class SplitRequest(BaseModel):
     text: str
-    language: str = "zh"
-    normalize: str = "llm"          # none | rule | llm
 
 
-class SegmentSentence(BaseModel):
+class SplitSentence(BaseModel):
     index: int
-    original: str
+    text: str
+
+
+class SplitResponse(BaseModel):
+    sentences: List[SplitSentence]
+
+
+class NormalizeRequest(BaseModel):
+    text: str
+
+
+class NormalizeResponse(BaseModel):
     tts_text: str
-    source: str                      # llm | rule | none
 
 
-class SegmentResponse(BaseModel):
-    sentences: List[SegmentSentence]
+class NormalizeBatchRequest(BaseModel):
+    sentences: List[str]
+    language: str = "chinese"
+
+
+class NormalizeBatchResponse(BaseModel):
+    results: List[str]

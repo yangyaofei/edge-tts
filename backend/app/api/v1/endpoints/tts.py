@@ -6,15 +6,13 @@ import logging
 from fastapi import APIRouter, HTTPException, Query, Depends, Request
 from fastapi.responses import StreamingResponse
 
-from app.schemas.tts import VoiceInfo, TTSRequest, SegmentRequest, SegmentSentence, SegmentResponse
+from app.schemas.tts import VoiceInfo, TTSRequest, SplitRequest, SplitSentence, SplitResponse, NormalizeRequest, NormalizeResponse, NormalizeBatchRequest, NormalizeBatchResponse
 from app.core.security import verify_token
 from app.core.config import settings
 from app.services.registry import EngineRegistry, register_builtin_engines
 from app.services.pipeline import TTSPipeline
-from app.services.text_preprocessor import TextPreprocessor
-from app.services.polyphone import PolyphoneFixer
-from app.services.chunker import TextChunker, split_sentences
-from app.services.llm_transcriber import LLMTranscriber
+from app.services.chunker import TextChunker, split_markdown
+from app.services.normalize_harness import normalize_sentence
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -40,28 +38,12 @@ def _engine_kwargs(engine_name: str) -> dict:
 
 
 def _build_pipeline(engine_name: str, preprocess: bool = True) -> TTSPipeline:
-    """构建 pipeline 实例。"""
+    """构建 pipeline 实例。纯 TTS,不做任何文本前处理(归一化已由 /normalize 接口完成)。"""
     engine = EngineRegistry.create(engine_name, **_engine_kwargs(engine_name))
-
-    preprocessor = TextPreprocessor() if (preprocess and settings.TTS_PREPROCESS_ENABLED) else None
-    polyphone_fixer = PolyphoneFixer() if (preprocess and settings.TTS_POLYPHONE_FIX_ENABLED) else None
     chunker = TextChunker()
-
-    llm_transcriber = None
-    if preprocess and settings.TTS_LLM_TRANSCRIBE_ENABLED:
-        llm_transcriber = LLMTranscriber(
-            api_url=settings.TTS_LLM_TRANSCRIBE_API_URL,
-            api_key=settings.TTS_LLM_TRANSCRIBE_API_KEY,
-            model=settings.TTS_LLM_TRANSCRIBE_MODEL,
-        )
-
     ref_trim = settings.QWEN3_TTS_REF_TRIM_SECONDS if engine_name == "qwen" else 8
-
     return TTSPipeline(
         engine=engine,
-        llm_transcriber=llm_transcriber,
-        preprocessor=preprocessor,
-        polyphone_fixer=polyphone_fixer,
         chunker=chunker,
         ref_trim_seconds=ref_trim,
         silence_between_chunks=settings.TTS_SILENCE_BETWEEN_CHUNKS,
@@ -120,77 +102,70 @@ async def edge_tts_stream(request: TTSRequest):
     return await tts_stream(request)
 
 
-# ---------- /segment: 分句 + 归一化 (纯文本预处理, 不碰音频) ----------
-
-# 模块级单例: 规则归一化无状态, 复用一个; LLM transcriber 按 endpoint 配置构建。
-_PREPROCESSOR = TextPreprocessor()
+# ---------- /split: 只分句 (不碰 LLM, 纯正则) ----------
 
 
-def _build_segment_llm() -> LLMTranscriber | None:
-    """构建 segment 专用的 LLM transcriber。
-
-    与 _build_pipeline() 不同: 这里 raise_on_error=True —— 失败时抛异常
-    而不是静默返回原文, 让 endpoint 能精确降级到 rule (source 可见)。
-    """
-    if not settings.TTS_LLM_TRANSCRIBE_ENABLED:
-        return None
-    if not (settings.TTS_LLM_TRANSCRIBE_API_URL and settings.TTS_LLM_TRANSCRIBE_API_KEY):
-        return None
-    return LLMTranscriber(
-        api_url=settings.TTS_LLM_TRANSCRIBE_API_URL,
-        api_key=settings.TTS_LLM_TRANSCRIBE_API_KEY,
-        model=settings.TTS_LLM_TRANSCRIBE_MODEL,
-        raise_on_error=True,
-        timeout=settings.TTS_LLM_TIMEOUT,
-    )
+@router.post("/split", response_model=SplitResponse, dependencies=[Depends(verify_token)])
+async def tts_split(request: SplitRequest):
+    """只分句,返回原始句子(不归一化)。text 拼接严格 == 输入原文。"""
+    text = (request.text or "").strip()
+    if not text:
+        return SplitResponse(sentences=[])
+    originals = split_markdown(text)
+    sentences = [SplitSentence(index=i, text=s) for i, s in enumerate(originals)]
+    return SplitResponse(sentences=sentences)
 
 
-@router.post("/segment", response_model=SegmentResponse, dependencies=[Depends(verify_token)])
-async def tts_segment(request: SegmentRequest):
-    """分句 + 归一化。返回逐句 original/tts_text, original 拼接 == 输入原文。
+# ---------- /normalize: 单句转换 (pydantic-ai 结构化) ----------
 
-    normalize:
-      - none: 不归一化, tts_text == original
-      - rule: TextPreprocessor (本地正则)
-      - llm:  LLMTranscriber 逐句并发, 单句失败降级 rule
+
+@router.post("/normalize", response_model=NormalizeResponse, dependencies=[Depends(verify_token)])
+async def tts_normalize(request: NormalizeRequest):
+    """单句归一化。pydantic-ai Agent 结构化输出,prompt 驱动所有转换规则。
+
+    失败时返回原文(不 crash),保证前端总有可播内容。
     """
     text = (request.text or "").strip()
     if not text:
-        return SegmentResponse(sentences=[])
+        return NormalizeResponse(tts_text="")
+    try:
+        tts_text = await asyncio.wait_for(
+            normalize_sentence(text), timeout=settings.TTS_LLM_TIMEOUT
+        )
+        return NormalizeResponse(tts_text=tts_text)
+    except Exception as e:
+        logger.warning(f"normalize failed ({len(text)} chars), return original: {e}")
+        return NormalizeResponse(tts_text=text)
 
-    mode = request.normalize
-    if mode not in ("none", "rule", "llm"):
-        raise HTTPException(status_code=400, detail=f"normalize must be none|rule|llm, got {mode!r}")
 
-    originals = split_sentences(text, min_len=4)
-    if not originals:
-        return SegmentResponse(sentences=[])
+# ---------- /normalize-batch: 多句并发归一化 (前端一次请求, 后端 gather) ----------
 
-    llm = _build_segment_llm() if mode == "llm" else None
-    sem = asyncio.Semaphore(settings.TTS_LLM_CONCURRENCY)
+_normalize_sem = asyncio.Semaphore(8)
 
-    async def normalize_one(sentence: str) -> tuple[str, str]:
-        """单句归一化, 返回 (tts_text, source)。"""
-        if mode == "none":
-            return sentence, "none"
-        if mode == "rule" or llm is None:
-            return _PREPROCESSOR.process(sentence), "rule"
-        # mode == "llm"
-        try:
-            async with sem:
-                tts_text = await asyncio.wait_for(llm.transcribe(sentence), timeout=settings.TTS_LLM_TIMEOUT)
-            tts_text = (tts_text or "").strip()
-            if not tts_text:
-                raise ValueError("LLM returned empty text")
-            return tts_text, "llm"
-        except Exception as e:
-            logger.warning(f"segment LLM normalize failed, fallback to rule: {e}")
-            return _PREPROCESSOR.process(sentence), "rule"
 
-    results = await asyncio.gather(*(normalize_one(s) for s in originals))
+async def _normalize_one(text: str) -> str:
+    """单句归一化, 失败返回原文。sem 控制并发。"""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    try:
+        async with _normalize_sem:
+            return await asyncio.wait_for(
+                normalize_sentence(t), timeout=settings.TTS_LLM_TIMEOUT
+            )
+    except Exception as e:
+        logger.warning(f"normalize failed ({len(t)} chars), return original: {e}")
+        return t
 
-    sentences = [
-        SegmentSentence(index=i, original=orig, tts_text=tts, source=src)
-        for i, (orig, (tts, src)) in enumerate(zip(originals, results))
-    ]
-    return SegmentResponse(sentences=sentences)
+
+@router.post("/normalize-batch", response_model=NormalizeBatchResponse, dependencies=[Depends(verify_token)])
+async def tts_normalize_batch(request: NormalizeBatchRequest):
+    """批量归一化。结果顺序与输入一致。单句失败降级原文。
+
+    前端一次请求归一化剩余全部句子(绕过浏览器同 host 6 连接限制),
+    后端 8 并发 gather 调 LLM。
+    """
+    if not request.sentences:
+        return NormalizeBatchResponse(results=[])
+    results = await asyncio.gather(*(_normalize_one(s) for s in request.sentences))
+    return NormalizeBatchResponse(results=results)

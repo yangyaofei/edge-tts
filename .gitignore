@@ -48,3 +48,6 @@ docker/qwen3-tts-server/json.hpp
 # Build artifacts
 .qwen3tts-work/
 docker/qwen3-tts-server/build/
+
+venv-asr/
+research/polyphone-verify/output/

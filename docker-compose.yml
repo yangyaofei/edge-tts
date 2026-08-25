@@ -52,6 +52,9 @@ services:
       - ./config:/app/config
     environment:
       - QWEN3_TTS_SERVER_URL=http://qwen3-tts-server:9880
+      - TTS_LLM_TRANSCRIBE_MODEL=deepseek-v4-flash
+      - TTS_LLM_TIMEOUT=120
+      - TTS_LLM_REASONING_EFFORT=low
     depends_on:
       qwen3-tts-server:
         condition: service_healthy
