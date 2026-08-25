@@ -5,7 +5,7 @@
          → pydantic-ai Agent (每次 run 新建实例, 工具闭包捕获该句 state)
          → 模型自主多轮调用工具:
              submit_edit(find, occurrence, to, rule)  替换编辑
-             submit_pause(after, occurrence)          插入停顿
+             submit_pause(after, occurrence, kind)    插入停顿 (kind: space 空格 / comma 逗号)
              query_lexicon(word)                      查词表
              check_conservation()                     数字守恒自查
              finish()                                 结束
@@ -124,7 +124,9 @@ SYSTEM_PROMPT = """你是中文语音合成(TTS)文本归一化编辑器。你�
   "邀请 Gemini 里 想离开的人" ✓ (Gemini 里 = 状语, 想离开 = 新谓语)
   "邀请 Gemini 里想 离开的人" ✗ (拆散了动宾短语 想离开)
 - 动宾短语/谓语内部禁止停顿: 想离开/要做/能吃/会来 不能拆
-- 短句内语义块用空格分隔, 意群间用逗号; 长句 (20字以上) 必须有逗号
+- **用 submit_pause 提交停顿, 必须指定 kind**:
+  - kind="space": 语义单元之间的轻停顿 (分词粒度, 句中主谓宾块) — 绝大多数停顿用它
+  - kind="comma": 意群/分句之间的重停顿 (逗号, 长句 20 字以上必须有)
 - 英文缩写与中文之间加空格
 
 ### 5. 符号清洗
@@ -147,6 +149,7 @@ class Edit:
     occurrence: int
     to: str = ""
     rule: str = ""
+    pause_kind: str = "space"  # pause 时: "space" 空格停顿 | "comma" 逗号停顿
 
 
 @dataclass
@@ -285,7 +288,7 @@ def _apply_edits(original: str, edits: list[Edit]) -> str:
     out = original
     for idx, length, e in sorted(located, key=lambda t: t[0], reverse=True):
         out = out[:idx] + e.to + out[idx + length:]
-    # 3. pause: 在 find 后插入逗号 (在替换结果上重新定位, 片段通常不受 replace 影响)
+    # 3. pause: 在 find 后插入空格或逗号 (在替换结果上重新定位, 片段通常不受 replace 影响)
     for e in edits:
         if e.kind != "pause":
             continue
@@ -296,7 +299,8 @@ def _apply_edits(original: str, edits: list[Edit]) -> str:
                 break
         if idx >= 0:
             end = idx + len(e.find)
-            out = out[:end] + "，" + out[end:]
+            sep = " " if e.pause_kind == "space" else "，"
+            out = out[:end] + sep + out[end:]
     return out
 
 
@@ -357,14 +361,16 @@ def _build_agent(state: HarnessState) -> Agent:
         return f"OK ({len(state.edits)} edits)"
 
     @agent.tool_plain
-    def submit_pause(after: str, occurrence: int) -> str:
-        """在片段 after (原文精确子串) 之后插入停顿逗号。occurrence 0-based。"""
+    def submit_pause(after: str, occurrence: int, kind: str = "space") -> str:
+        """在片段 after (原文精确子串) 之后插入停顿。kind: "space"=空格(语义单元轻停顿), "comma"=逗号(意群重停顿)。occurrence 0-based。"""
         n = state.original.count(after)
         if n == 0:
             raise ModelRetry(f"after {after!r} 不在原文中。")
         if occurrence < 0 or occurrence >= n:
             raise ModelRetry(f"occurrence={occurrence} 越界 ({after!r} 出现 {n} 次)。")
-        state.edits.append(Edit("pause", after, occurrence, "", "PAUSE"))
+        if kind not in ("space", "comma"):
+            raise ModelRetry(f"kind={kind!r} 无效, 只允许 'space' 或 'comma'。")
+        state.edits.append(Edit("pause", after, occurrence, "", "PAUSE", kind))
         return f"OK ({len(state.edits)} edits)"
 
     @agent.tool_plain
@@ -431,4 +437,4 @@ async def normalize_sentence(text: str) -> str:
     if not _digit_conservation_ok(text, final):
         logger.warning(f"harness digit conservation failed, fallback original: {text[:50]}")
         return text
-    return final
+    return re.sub(r" {2,}", " ", final)  # 压缩连续空格 (停顿插在已有空格后)
