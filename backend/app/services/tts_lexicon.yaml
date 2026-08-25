@@ -27,6 +27,8 @@ polyphone:
   压根: 压yà根
   哈达: 哈hǎ达
   吐蕃: 吐bō蕃
+  反过来称: 反过来chēng   # "称"作称呼义读 chēng (用户实测 TTS 读错)
+  对称: 对chèn          # "称"对称义读 chèn
 
 unit:
   GB: G B

@@ -99,10 +99,19 @@ SYSTEM_PROMPT = """你是中文语音合成(TTS)文本归一化编辑器。你�
   即: 助词"地"→"的", 助词"得"→"的", "的"本身保留
   的地得其他用法不替换: 目的dì/的确dí/得手dé
 - 上下文能判断的常见多音词: 不处理 (银行/音乐/成长 TTS 自己会读对)
-- 只处理歧义高危词, 且必须查询词表 (query_lexicon) 获取标准替换形式
-- 其他替换形式: 拼音紧跟被替换的字, 无括号无空格: 重新 → chóng新
-- 声调必须用调号符号 (ā á ǎ à ē é ě è ī í ǐ ì ō ó ǒ ò ū ú ǔ ù ǖ ǘ ǚ ǜ),
-  严禁数字声调 (cheng4 / cheng2 都是错的) 和括号/声字标注 ((cheng) / cheng4声 都是错的)
+- 只处理歧义高危词 (语境可能读错的), 且必须查询词表 (query_lexicon) 获取标准替换形式
+- **高危多音字清单 (遇到必须用 pinyin 参数标注, 除非上下文绝对唯一)**:
+  称 (称呼→chēng / 对称→chèn)、重 (重新→chóng / 重要→zhòng)、行 (银行→háng / 行走→xíng)、
+  乐 (快乐→lè / 音乐→yuè)、长 (成长→zhǎng / 长度→cháng)、参 (参加→cān / 参差→cēn / 人参→shēn)、
+  数 (数据→shù / 数落→shǔ)、会 (会议→huì / 会计→kuài)、差 (差别→chā / 差劲→chà / 出差→chāi)、
+  的 (目的→dì / 的确→dí)、还 (还有→hái / 归还→huán)、都 (都市→dū / 都是→dōu)、
+  了 (了解→liǎo / 走了→le)、假 (真假→jiǎ / 放假→jià)、间 (时间→jiān / 间隔→jiàn)、
+  相 (相信→xiāng / 相片→xiàng)、恶 (恶心→ě / 可恶→wù)、薄 (薄弱→bó / 薄饼→báo)
+- **多音字标注格式 (重要)**: 用 submit_edit 的 pinyin 参数给出读音, 程序会校验合法性并规范化格式:
+  - pinyin 可写 chēng / cheng1 / cheng 任意格式 (程序统一转带调号 chēng)
+  - to 里写替换后的完整文本 (拼音紧跟被替换的字): 重新 → chóng新
+  - 不要自己写括号/数字声调/声字 (cheng4声 是错的)
+  - 程序会检测读音对该字是否合法, 不合法会拒绝并告诉你合法读音
 - 标音前必须确认正确读音 (用 query_lexicon 或词典), 标错比不标更糟
 - 严禁给 从/同/当/了/着 等虚词标音
 
@@ -173,6 +182,65 @@ def _matched_entries(text: str) -> list[str]:
 
 
 # ---------- harness 校验 (工具内联) ----------
+
+# 拼音声调: 数字声调 → 调号符号 (cheng1 → chēng)
+# 调号顺序与 _VOWEL_ORDER (a o e i u ü) 对齐
+_VOWEL_ORDER = "aoeiuv"  # v = ü
+_TONE_MARKS = {
+    "1": "āōēīūǖ",
+    "2": "áóéíúǘ",
+    "3": "ǎǒěǐǔǚ",
+    "4": "àòèìùǜ",
+}
+_TONE_STRIP = str.maketrans("āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜ", "aaaaoooeeeeeiiiiuuuuvvvv")
+
+
+def _normalize_tone(pinyin: str) -> str:
+    """把各种声调格式统一为带调号拼音: cheng1→chēng, cheng→cheng(无调), chēng 保持。
+
+    规则: 声调数字跟在韵母元音后 → 移到韵腹元音上加调号 (普通话标调规则:
+    a 优先, 其次 o/e, 再 i/u/ü); 无声调数字保持。
+    """
+    if not pinyin:
+        return pinyin
+    m = re.match(r"^([a-zA-ZüÜ]+)([1-4])$", pinyin)
+    if not m:
+        return pinyin.lower()  # 已是带调号或纯拼音, 统一小写
+    base, tone = m.group(1).lower(), int(m.group(2))
+    base = base.replace("ü", "v")  # 统一用 v 处理韵腹
+    # 找韵腹 (a 优先, o/e 次之, i/u/ü 最后)
+    target = None
+    for ch in "aoeiuv":
+        if ch in base:
+            target = ch
+            break
+    if target is None:
+        return base.replace("v", "ü") + str(tone)
+    idx = base.index(target)
+    mark = _TONE_MARKS[str(tone)][_VOWEL_ORDER.index(target)]
+    return (base[:idx] + mark + base[idx + 1:]).replace("v", "ü")
+
+
+def _pinyin_legal(chars: str, pinyin: str) -> tuple[bool, set[str]]:
+    """用 pypinyin 查 chars 里每个字的合法读音, 验证 pinyin (无调) 是否在候选里。
+
+    返回 (是否合法, 合法读音集合 (带调, 如 {chēng, chèn}) )。
+    """
+    from pypinyin import pinyin as pypinyin_all, Style
+
+    legal: set[str] = set()
+    for ch in chars:
+        if "\u4e00" <= ch <= "\u9fff":
+            # heteronym=True 返回全部读音 (多音字: 称 chēng/chèn/chèng)
+            for plist in pypinyin_all(ch, style=Style.TONE, heteronym=True):
+                for p in plist:
+                    legal.add(p)
+    target = _normalize_tone(pinyin)  # 转带调
+    target_plain = target.translate(_TONE_STRIP)
+    for p in legal:
+        if p.translate(_TONE_STRIP) == target_plain:
+            return True, legal
+    return False, legal
 
 
 def _validate_edit(state: HarnessState, find: str, occurrence: int, to: str) -> None:
@@ -272,9 +340,19 @@ def _build_agent(state: HarnessState) -> Agent:
     agent = Agent(model, name="normalize_editor", system_prompt=SYSTEM_PROMPT)
 
     @agent.tool_plain
-    def submit_edit(find: str, occurrence: int, to: str, rule: str) -> str:
-        """提交一条替换编辑。find 必须是原文精确子串 (≥2字符); occurrence 为第几次出现 (0-based); to 为替换文本; rule 为规则类别 (TN/POLY/ABBR/PAUSE/CLEAN)。"""
+    def submit_edit(find: str, occurrence: int, to: str, rule: str, pinyin: str = "") -> str:
+        """提交一条替换编辑。find 必须是原文精确子串 (≥2字符); occurrence 为第几次出现 (0-based); to 为替换文本; rule 为规则类别 (TN/POLY/ABBR/PAUSE/CLEAN); pinyin 可选 — 多音字标注时给出读音 (如 chēng/cheng1/cheng), 程序校验并规范格式。"""
         _validate_edit(state, find, occurrence, to)
+        if pinyin:
+            ok, legal = _pinyin_legal(find, pinyin)
+            if not ok:
+                legal_str = "/".join(sorted(legal)) if legal else "(查无)"
+                raise ModelRetry(
+                    f"读音 {pinyin!r} 对 {find!r} 不合法。该字合法读音: {legal_str}。请修正 pinyin 后重提。"
+                )
+            # 把 to 里的拼音 (可能是数字声调/无调) 规范化为带调号
+            norm = _normalize_tone(pinyin)
+            to = re.sub(r"[a-zA-ZüÜāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ]+", norm, to, count=1)
         state.edits.append(Edit("replace", find, occurrence, to, rule))
         return f"OK ({len(state.edits)} edits)"
 
