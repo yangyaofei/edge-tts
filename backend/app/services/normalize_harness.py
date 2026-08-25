@@ -93,29 +93,26 @@ SYSTEM_PROMPT = """你是中文语音合成(TTS)文本归一化编辑器。你�
 - 纯英文单词/产品名保持原样: Python, DeepSeek, Claude 不拆
 - 型号: 字母部分拆开 + 版本数字转中文: Qwen-3.8 → Q w e n 三点八
 
-### 3. 多音字 (保守!)
+### 3. 多音字 (pypinyin 扫描表驱动, 必须逐一判断)
 - 的/地/得 作结构助词时读轻声 de, TTS 总读错, 统一替换为同音汉字"的" (不加拼音, 无声调拼音会被当字母双读):
   我的书 → 我 的 书; 隐晦地 → 隐晦 的; 跑得快 → 跑 的 快
   即: 助词"地"→"的", 助词"得"→"的", "的"本身保留
   的地得其他用法不替换: 目的dì/的确dí/得手dé
-- 上下文能判断的常见多音词: 不处理 (银行/音乐/成长 TTS 自己会读对)
-- 只处理歧义高危词 (语境可能读错的), 且必须查询词表 (query_lexicon) 获取标准替换形式
-- **高危多音字清单 (遇到必须用 pinyin 参数标注, 除非上下文绝对唯一)**:
-  称 (称呼→chēng / 对称→chèn)、重 (重新→chóng / 重要→zhòng)、行 (银行→háng / 行走→xíng)、
-  乐 (快乐→lè / 音乐→yuè)、长 (成长→zhǎng / 长度→cháng)、参 (参加→cān / 参差→cēn / 人参→shēn)、
-  数 (数据→shù / 数落→shǔ)、会 (会议→huì / 会计→kuài)、差 (差别→chā / 差劲→chà / 出差→chāi)、
-  的 (目的→dì / 的确→dí)、还 (还有→hái / 归还→huán)、都 (都市→dū / 都是→dōu)、
-  了 (了解→liǎo / 走了→le)、假 (真假→jiǎ / 放假→jià)、间 (时间→jiān / 间隔→jiàn)、
-  相 (相信→xiāng / 相片→xiàng)、恶 (恶心→ě / 可恶→wù)、薄 (薄弱→bó / 薄饼→báo)
+- 程序已用 pypinyin 扫出本句全部多音字及候选读音 (见下方"多音字扫描表")
+- **对扫描表中每个字, 逐一结合语境判断读音**:
+  - 常见多音词语境唯一 (银行/音乐/成长/处理/重要/重新) → TTS 自己会读对, 跳过不标
+  - 语境有歧义、TTS 可能读错 → 必须用 submit_edit 的 pinyin 参数标注
+  - 候选音都不合适时, 也可提交候选外的读音 (程序会校验该字确有此音)
+- 扫描表之外的 (词级多音词/罕见字), 你认为 TTS 会读错的也可以标注
 - **多音字标注格式 (重要)**: 用 submit_edit 的 pinyin 参数给出读音, 程序会校验合法性并规范化格式:
   - pinyin 可写 chēng / cheng1 / cheng 任意格式 (程序统一转带调号 chēng)
-  - to 里写替换后的完整文本 (拼音紧跟被替换的字): 重新 → chóng新
+  - to 里写替换后的完整文本 (拼音完全替换被标字, 紧跟前后字): 重新 → chóng新
   - 不要自己写括号/数字声调/声字 (cheng4声 是错的)
   - 程序会检测读音对该字是否合法, 不合法会拒绝并告诉你合法读音
 - 标音前必须确认正确读音 (用 query_lexicon 或词典), 标错比不标更糟
-- 严禁给 从/同/当/了/着 等虚词标音
+- 严禁给 从/同/当/了/着 等虚词标音 (语境绝对唯一, 标注反而引入双读)
 
-### 4. 停顿 (语义单元粒度, 句内也要分块)
+### 4. 停顿 (语义单元粒度, 考虑位置与时长)
 - 停顿粒度 = 语义单元 (不只是长句才分): 每个意群之间都要有分界
   例: 苹果 起诉 爆料人 Jon Prosser 的 诉讼 在 取证环节 出现 拖延
   (苹果-起诉-爆料人Jon Prosser的-诉讼-在-取证环节-出现拖延, 每个主谓宾块都分)
@@ -124,9 +121,10 @@ SYSTEM_PROMPT = """你是中文语音合成(TTS)文本归一化编辑器。你�
   "邀请 Gemini 里 想离开的人" ✓ (Gemini 里 = 状语, 想离开 = 新谓语)
   "邀请 Gemini 里想 离开的人" ✗ (拆散了动宾短语 想离开)
 - 动宾短语/谓语内部禁止停顿: 想离开/要做/能吃/会来 不能拆
-- **用 submit_pause 提交停顿, 必须指定 kind**:
-  - kind="space": 语义单元之间的轻停顿 (分词粒度, 句中主谓宾块) — 绝大多数停顿用它
-  - kind="comma": 意群/分句之间的重停顿 (逗号, 长句 20 字以上必须有)
+- **用 submit_pause 提交停顿, 必须指定 kind (停顿时长三档, 依次递增)**:
+  - kind="space": 微停顿 (分词粒度, 句中主谓宾块之间) — 绝大多数停顿用它
+  - kind="comma": 短停顿 (意群/分句之间; 长句 20 字以上必须有)
+  - kind="semicolon": 中停顿 (大意群转折/强调分隔, 少用)
 - 英文缩写与中文之间加空格
 
 ### 5. 符号清洗
@@ -149,7 +147,7 @@ class Edit:
     occurrence: int
     to: str = ""
     rule: str = ""
-    pause_kind: str = "space"  # pause 时: "space" 空格停顿 | "comma" 逗号停顿
+    pause_kind: str = "space"  # pause 时: "space" 微停顿 | "comma" 短停顿 | "semicolon" 中停顿
 
 
 @dataclass
@@ -182,6 +180,28 @@ def _matched_entries(text: str) -> list[str]:
             if k and k in text:
                 entries.append(f"  {k} → {v}")
     return entries
+
+
+def _scan_polyphone_hints(text: str) -> list[str]:
+    """pypinyin 预扫描: 找出句中全部多音字及候选读音 (注入 prompt 供 LLM 选音)。
+
+    pypinyin 是信息提供者 (事前), 不是校验器 (事后):
+    - 扫出的多音字 + 候选音 = 必须逐一判断的内容
+    - LLM 从候选选音; 也可选候选外的合法音; 也可处理扫描外的字
+    """
+    from pypinyin import pinyin as pypinyin_all, Style
+
+    lines: list[str] = []
+    seen: set[str] = set()
+    for i, ch in enumerate(text):
+        if not ("\u4e00" <= ch <= "\u9fff") or ch in seen:
+            continue
+        cand = sorted({p for pl in pypinyin_all(ch, style=Style.TONE, heteronym=True) for p in pl})
+        if len(cand) > 1:
+            seen.add(ch)
+            ctx = text[max(0, i - 4) : i] + "「" + ch + "」" + text[i + 1 : i + 5]
+            lines.append(f"  {ch} (候选: {'/'.join(cand)}) 出现于 …{ctx}…")
+    return lines
 
 
 # ---------- harness 校验 (工具内联) ----------
@@ -299,7 +319,7 @@ def _apply_edits(original: str, edits: list[Edit]) -> str:
                 break
         if idx >= 0:
             end = idx + len(e.find)
-            sep = " " if e.pause_kind == "space" else "，"
+            sep = {"space": " ", "comma": "，", "semicolon": "；"}.get(e.pause_kind, " ")
             out = out[:end] + sep + out[end:]
     return out
 
@@ -362,14 +382,14 @@ def _build_agent(state: HarnessState) -> Agent:
 
     @agent.tool_plain
     def submit_pause(after: str, occurrence: int, kind: str = "space") -> str:
-        """在片段 after (原文精确子串) 之后插入停顿。kind: "space"=空格(语义单元轻停顿), "comma"=逗号(意群重停顿)。occurrence 0-based。"""
+        """在片段 after (原文精确子串) 之后插入停顿。kind (时长递增): "space"=微停顿(分词), "comma"=短停顿(意群), "semicolon"=中停顿(大意群分隔)。occurrence 0-based。"""
         n = state.original.count(after)
         if n == 0:
             raise ModelRetry(f"after {after!r} 不在原文中。")
         if occurrence < 0 or occurrence >= n:
             raise ModelRetry(f"occurrence={occurrence} 越界 ({after!r} 出现 {n} 次)。")
-        if kind not in ("space", "comma"):
-            raise ModelRetry(f"kind={kind!r} 无效, 只允许 'space' 或 'comma'。")
+        if kind not in ("space", "comma", "semicolon"):
+            raise ModelRetry(f"kind={kind!r} 无效, 只允许 'space'/'comma'/'semicolon'。")
         state.edits.append(Edit("pause", after, occurrence, "", "PAUSE", kind))
         return f"OK ({len(state.edits)} edits)"
 
@@ -425,8 +445,16 @@ async def normalize_sentence(text: str) -> str:
             "\n\n## 本句命中的词表 (约定读法, 必须遵守)\n" + "\n".join(matched)
         )
 
+    poly_hints = _scan_polyphone_hints(text)
+    poly_block = ""
+    if poly_hints:
+        poly_block = (
+            "\n\n## 多音字扫描表 (pypinyin 预扫描, 每个字都必须逐一判断读音)\n"
+            + "\n".join(poly_hints)
+        )
+
     await agent.run(
-        f"请归一化这个句子:\n{text}{lexicon_block}",
+        f"请归一化这个句子:\n{text}{lexicon_block}{poly_block}",
         model_settings={"thinking": settings.TTS_LLM_REASONING_EFFORT},
     )
 
