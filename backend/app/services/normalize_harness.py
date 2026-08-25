@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -93,24 +94,23 @@ SYSTEM_PROMPT = """你是中文语音合成(TTS)文本归一化编辑器。你�
 - 纯英文单词/产品名保持原样: Python, DeepSeek, Claude 不拆
 - 型号: 字母部分拆开 + 版本数字转中文: Qwen-3.8 → Q w e n 三点八
 
-### 3. 多音字 (pypinyin 扫描表驱动, 必须逐一判断)
+### 3. 多音字 (pypinyin 扫描表驱动, 全部纠正)
 - 的/地/得 作结构助词时读轻声 de, TTS 总读错, 统一替换为同音汉字"的" (不加拼音, 无声调拼音会被当字母双读):
   我的书 → 我 的 书; 隐晦地 → 隐晦 的; 跑得快 → 跑 的 快
   即: 助词"地"→"的", 助词"得"→"的", "的"本身保留
   的地得其他用法不替换: 目的dì/的确dí/得手dé
 - 程序已用 pypinyin 扫出本句全部多音字及候选读音 (见下方"多音字扫描表")
-- **对扫描表中每个字, 逐一结合语境判断读音**:
-  - 常见多音词语境唯一 (银行/音乐/成长/处理/重要/重新) → TTS 自己会读对, 跳过不标
-  - 语境有歧义、TTS 可能读错 → 必须用 submit_edit 的 pinyin 参数标注
-  - 候选音都不合适时, 也可提交候选外的读音 (程序会校验该字确有此音)
-- 扫描表之外的 (词级多音词/罕见字), 你认为 TTS 会读错的也可以标注
+- **对扫描表中每个字, 必须结合语境选定读音, 并用 submit_edit 的 pinyin 参数标注 — 全部纠正, 一个都不许跳过**
+  (TTS 上下文消歧不可靠, "重编程" 实测会被读成 zhòng, 所以不能赌 TTS 能读对)
+  - 唯一例外: 语境绝对唯一的轻声助词/虚词 (的/了/着/地/得/都/还/从/同/当) 不标 (标注会引入双读)
+- 候选音都不合适时, 也可提交候选外的读音 (程序会校验该字确有此音)
+- 扫描表之外的 (词级多音词/罕见字/英文缩写), 同样要标注
 - **多音字标注格式 (重要)**: 用 submit_edit 的 pinyin 参数给出读音, 程序会校验合法性并规范化格式:
   - pinyin 可写 chēng / cheng1 / cheng 任意格式 (程序统一转带调号 chēng)
   - to 里写替换后的完整文本 (拼音完全替换被标字, 紧跟前后字): 重新 → chóng新
   - 不要自己写括号/数字声调/声字 (cheng4声 是错的)
   - 程序会检测读音对该字是否合法, 不合法会拒绝并告诉你合法读音
 - 标音前必须确认正确读音 (用 query_lexicon 或词典), 标错比不标更糟
-- 严禁给 从/同/当/了/着 等虚词标音 (语境绝对唯一, 标注反而引入双读)
 
 ### 4. 停顿 (意群流畅优先, 考虑位置与时长)
 - 停顿单位 = **意群** (一口气能读完的意义单元), 不是单个词:
@@ -184,22 +184,240 @@ def _matched_entries(text: str) -> list[str]:
     return entries
 
 
+# ---------- 常用多音字表 (阈值: 表内必须全标, 表外 LLM 自主) ----------
+# 值 = 该字常用读音 (已过滤生僻古音, 如 盯 的 chéng、放 的 fāng/fǎng)
+# 维护: 发现 TTS 读错的多音字 → 加入此表
+COMMON_POLYPHONES: dict[str, list[str]] = {
+    "重": ["chóng", "zhòng"],
+    "行": ["háng", "xíng"],
+    "长": ["cháng", "zhǎng"],
+    "乐": ["lè", "yuè"],
+    "称": ["chēng", "chèn", "chèng"],
+    "参": ["cān", "cēn", "shēn"],
+    "数": ["shù", "shǔ"],
+    "会": ["huì", "kuài"],
+    "差": ["chā", "chà", "chāi"],
+    "为": ["wéi", "wèi"],
+    "假": ["jiǎ", "jià"],
+    "间": ["jiān", "jiàn"],
+    "相": ["xiāng", "xiàng"],
+    "恶": ["ě", "è", "wù"],
+    "薄": ["bó", "báo", "bò"],
+    "着": ["zháo", "zhuó", "zhāo"],
+    "落": ["luò", "là", "lào"],
+    "曲": ["qū", "qǔ"],
+    "处": ["chù", "chǔ"],
+    "觉": ["jué", "jiào"],
+    "教": ["jiào", "jiāo"],
+    "朝": ["cháo", "zhāo"],
+    "鲜": ["xiān", "xiǎn"],
+    "血": ["xuè", "xiě"],
+    "宿": ["sù", "xiǔ", "xiù"],
+    "舍": ["shè", "shě"],
+    "弹": ["tán", "dàn"],
+    "干": ["gān", "gàn"],
+    "得": ["dé", "děi"],
+    "应": ["yīng", "yìng"],
+    "兴": ["xīng", "xìng"],
+    "解": ["jiě", "jiè", "xiè"],
+    "塞": ["sāi", "sài", "sè"],
+    "将": ["jiāng", "jiàng"],
+    "降": ["jiàng", "xiáng"],
+    "量": ["liàng", "liáng"],
+    "中": ["zhōng", "zhòng"],
+    "便": ["biàn", "pián"],
+    "几": ["jǐ", "jī"],
+    "传": ["chuán", "zhuàn"],
+    "单": ["dān", "chán", "shàn"],
+    "转": ["zhuǎn", "zhuàn"],
+    "担": ["dān", "dàn"],
+    "省": ["shěng", "xǐng"],
+    "切": ["qiè", "qiē"],
+    "宁": ["níng", "nìng"],
+    "供": ["gōng", "gòng"],
+    "调": ["tiáo", "diào"],
+    "强": ["qiáng", "qiǎng", "jiàng"],
+    "种": ["zhǒng", "zhòng"],
+    "分": ["fēn", "fèn"],
+    "角": ["jiǎo", "jué"],
+    "累": ["lèi", "lěi", "léi"],
+    "难": ["nán", "nàn"],
+    "片": ["piàn", "piān"],
+    "奇": ["qí", "jī"],
+    "任": ["rèn", "rén"],
+    "盛": ["shèng", "chéng"],
+    "石": ["shí", "dàn"],
+    "率": ["lǜ", "shuài"],
+    "模": ["mó", "mú"],
+    "背": ["bèi", "bēi"],
+    "结": ["jié", "jiē"],
+    "系": ["xì", "jì"],
+    "看": ["kàn", "kān"],
+    "空": ["kōng", "kòng"],
+    "没": ["méi", "mò"],
+    "藏": ["cáng", "zàng"],
+    "划": ["huá", "huà"],
+    "尽": ["jìn", "jǐn"],
+    "漂": ["piào", "piāo", "piǎo"],
+    "悄": ["qiāo", "qiǎo"],
+    "咽": ["yān", "yàn", "yè"],
+    "载": ["zài", "zǎi"],
+    "折": ["zhé", "shé", "zhē"],
+    "挣": ["zhēng", "zhèng"],
+    "症": ["zhèng", "zhēng"],
+    "荫": ["yīn", "yìn"],
+    "扎": ["zhā", "zhá", "zā"],
+    "挨": ["āi", "ái"],
+    "奔": ["bēn", "bèn"],
+    "屏": ["píng", "bǐng"],
+    "曾": ["céng", "zēng"],
+    "匙": ["chí", "shi"],
+    "冲": ["chōng", "chòng"],
+    "畜": ["chù", "xù"],
+    "幢": ["zhuàng", "chuáng"],
+    "逮": ["dài", "dǎi"],
+    "当": ["dāng", "dàng"],
+    "倒": ["dào", "dǎo"],
+    "钉": ["dīng", "dìng"],
+    "度": ["dù", "duó"],
+    "囤": ["tún", "dùn"],
+    "发": ["fā", "fà"],
+    "缝": ["féng", "fèng"],
+    "服": ["fú", "fù"],
+    "杆": ["gān", "gǎn"],
+    "革": ["gé", "jí"],
+    "给": ["gěi", "jǐ"],
+    "冠": ["guān", "guàn"],
+    "好": ["hǎo", "hào"],
+    "喝": ["hē", "hè"],
+    "横": ["héng", "hèng"],
+    "哄": ["hōng", "hǒng", "hòng"],
+    "混": ["hùn", "hún"],
+    "济": ["jì", "jǐ"],
+    "监": ["jiān", "jiàn"],
+    "校": ["xiào", "jiào"],
+    "劲": ["jìn", "jìng"],
+    "据": ["jù", "jū"],
+    "卷": ["juàn", "juǎn"],
+    "卡": ["kǎ", "qiǎ"],
+    "壳": ["ké", "qiào"],
+    "括": ["kuò", "guā"],
+    "俩": ["liǎ", "liǎng"],
+    "笼": ["lóng", "lǒng"],
+    "露": ["lù", "lòu"],
+    "绿": ["lǜ", "lù"],
+    "埋": ["mái", "mán"],
+    "蔓": ["màn", "wàn"],
+    "蒙": ["méng", "mēng", "měng"],
+    "秘": ["mì", "bì"],
+    "磨": ["mó", "mò"],
+    "哪": ["nǎ", "na"],
+    "弄": ["nòng", "lòng"],
+    "排": ["pái", "pǎi"],
+    "胖": ["pàng", "pán"],
+    "泡": ["pào", "pāo"],
+    "撇": ["piē", "piě"],
+    "迫": ["pò", "pǎi"],
+    "仆": ["pú", "pū"],
+    "铺": ["pù", "pū"],
+    "蹊": ["qī", "xī"],
+    "亲": ["qīn", "qìng"],
+    "区": ["qū", "ōu"],
+    "散": ["sàn", "sǎn"],
+    "丧": ["sàng", "sāng"],
+    "扫": ["sǎo", "sào"],
+    "煞": ["shà", "shā"],
+    "扇": ["shàn", "shān"],
+    "少": ["shǎo", "shào"],
+    "蛇": ["shé", "yí"],
+    "似": ["sì", "shì"],
+    "遂": ["suì", "suí"],
+    "苔": ["tái", "tāi"],
+    "提": ["tí", "dī"],
+    "帖": ["tiě", "tiē", "tiè"],
+    "通": ["tōng", "tòng"],
+    "吐": ["tǔ", "tù"],
+    "拓": ["tuò", "tà"],
+    "吓": ["xià", "hè"],
+    "削": ["xuē", "xiāo"],
+    "熏": ["xūn", "xùn"],
+    "殷": ["yīn", "yān", "yǐn"],
+    "饮": ["yǐn", "yìn"],
+    "佣": ["yōng", "yòng"],
+    "与": ["yǔ", "yù"],
+    "晕": ["yūn", "yùn"],
+    "脏": ["zāng", "zàng"],
+    "占": ["zhàn", "zhān"],
+    "涨": ["zhǎng", "zhàng"],
+    "爪": ["zhuǎ", "zhǎo"],
+    "正": ["zhèng", "zhēng"],
+    "只": ["zhǐ", "zhī"],
+    "轴": ["zhóu", "zhòu"],
+    "琢": ["zhuó", "zuó"],
+    "仔": ["zǐ", "zǎi"],
+    "钻": ["zuān", "zuàn"],
+    "作": ["zuò", "zuō"],
+    "大": ["dà", "dài"],
+    "艾": ["ài", "yì"],
+    "堡": ["bǎo", "pù", "bǔ"],
+    "暴": ["bào", "pù"],
+    "辟": ["pì", "bì"],
+    "泊": ["bó", "pō"],
+    "场": ["chǎng", "cháng"],
+    "澄": ["chéng", "dèng"],
+    "臭": ["chòu", "xiù"],
+    "揣": ["chuāi", "chuǎi", "chuài"],
+    "创": ["chuàng", "chuāng"],
+    "悼": ["dào", "dǎo"],
+    "斗": ["dǒu", "dòu"],
+    "读": ["dú", "dòu"],
+    "肚": ["dù", "dǔ"],
+    "坊": ["fāng", "fáng"],
+    "菲": ["fēi", "fěi"],
+    "佛": ["fó", "fú"],
+    "膏": ["gāo", "gào"],
+    "蛤": ["gé", "há"],
+    "葛": ["gé", "gě"],
+    "更": ["gēng", "gèng"],
+    "勾": ["gōu", "gòu"],
+    "骨": ["gǔ", "gū"],
+    "观": ["guān", "guàn"],
+    "号": ["hào", "háo"],
+    "荷": ["hé", "hè"],
+    "夹": ["jiā", "jiá", "gā"],
+    "节": ["jié", "jiē"],
+    "可": ["kě", "kè"],
+    "擂": ["léi", "lèi"],
+    "论": ["lùn", "lún"],
+    "抹": ["mǒ", "mò", "mā"],
+    "脉": ["mài", "mò"],
+    "眯": ["mī", "mí"],
+    "炮": ["pào", "páo", "bāo"],
+    "朴": ["pǔ", "pò", "pō", "piáo"],
+    "浅": ["qiǎn", "jiān"],
+    "纤": ["xiān", "qiàn"],
+    "翘": ["qiào", "qiáo"],
+    "色": ["sè", "shǎi"],
+    "刹": ["chà", "shā"],
+    "拾": ["shí", "shè"],
+    "术": ["shù", "zhú"],
+    "挑": ["tiāo", "tiǎo"],
+    "圩": ["wéi", "xū"],
+}
+
 def _scan_polyphone_hints(text: str) -> list[str]:
-    """pypinyin 预扫描: 找出句中全部多音字及候选读音 (注入 prompt 供 LLM 选音)。
+    """常用多音字预扫描: 找出句中命中 COMMON_POLYPHONES 表的字 (注入 prompt 供 LLM 选音)。
 
-    pypinyin 是信息提供者 (事前), 不是校验器 (事后):
-    - 扫出的多音字 + 候选音 = 必须逐一判断的内容
-    - LLM 从候选选音; 也可选候选外的合法音; 也可处理扫描外的字
+    阈值: 表内字必须全标 (prompt 强制), 表外生僻多音字 LLM 自主。
+    不用 pypinyin 全量扫描 (heteronym 含生僻古音, 噪音大, 会把半个句子的字都标成多音字)。
     """
-    from pypinyin import pinyin as pypinyin_all, Style
-
     lines: list[str] = []
     seen: set[str] = set()
     for i, ch in enumerate(text):
         if not ("\u4e00" <= ch <= "\u9fff") or ch in seen:
             continue
-        cand = sorted({p for pl in pypinyin_all(ch, style=Style.TONE, heteronym=True) for p in pl})
-        if len(cand) > 1:
+        cand = COMMON_POLYPHONES.get(ch)
+        if cand and len(cand) >= 2:
             seen.add(ch)
             ctx = text[max(0, i - 4) : i] + "「" + ch + "」" + text[i + 1 : i + 5]
             lines.append(f"  {ch} (候选: {'/'.join(cand)}) 出现于 …{ctx}…")
@@ -272,7 +490,10 @@ def _validate_edit(state: HarnessState, find: str, occurrence: int, to: str) -> 
     """校验单条编辑, 不合格 raise ModelRetry (回喂模型修正)。"""
     n = state.original.count(find)
     if n == 0:
-        raise ModelRetry(f"find {find!r} 不在原文中。请从原文复制精确片段。")
+        raise ModelRetry(
+            f"find {find!r} 不在原文中。find 必须是【原文】的精确子串, 不含任何拼音标注。"
+            "例: 原文 '银行重新' 就写 find='银行重新', 绝不能写 '银háng重新'。"
+        )
     if occurrence < 0 or occurrence >= n:
         raise ModelRetry(f"occurrence={occurrence} 越界 ({find!r} 出现 {n} 次)。")
     if len(find) < 2:
@@ -286,11 +507,84 @@ def _validate_edit(state: HarnessState, find: str, occurrence: int, to: str) -> 
         raise ModelRetry(f"to {to!r} 无有效文字内容。")
 
 
+_PIN_CHARS = "a-zA-ZüÜāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ"
+
+
+# 标准普通话音节 (无调) — 用于粘连拼音的从左最大匹配切分
+_SYLLABLES = frozenset(
+    """a ai an ang ao ba bai ban bang bao bei ben beng bi bian biao bie bin bing bo bu
+    ca cai can cang cao ce cen ceng cha chai chan chang chao che chen cheng chi chong
+    chou chu chua chuai chuan chuang chui chun chuo ci cong cou cu cuan cui cun cuo da
+    dai dan dang dao de dei den deng di dia dian diao die ding diu dong dou du duan
+    dui dun duo e ei en eng er fa fan fang fei fen feng fo fou fu ga gai gan gang gao
+    ge gei gen geng gong gou gu gua guai guan guang gui gun guo ha hai han hang hao he
+    hei hen heng hong hou hu hua huai huan huang hui hun huo ji jia jian jiang jiao jie
+    jin jing jiong jiu ju juan jue jun ka kai kan kang kao ke ken keng kong kou ku kua
+    kuai kuan kuang kui kun kuo la lai lan lang lao le lei leng li lia lian liang liao
+    lie lin ling liu long lou lu luan lun luo lv lve ma mai man mang mao me mei men
+    meng mi mian miao mie min ming miu mo mou mu na nai nan nang nao ne nei nen neng
+    ni nian niang niao nie nin ning niu nong nou nu nuan nuo nv nve o ou pa pai pan
+    pang pao pei pen peng pi pian piao pie pin ping po pou pu qi qia qian qiang qiao
+    qie qin qing qiong qiu qu quan que qun ran rang rao re ren reng ri rong rou ru
+    ruan rui run ruo sa sai san sang sao se sen seng sha shai shan shang shao she shei
+    shen sheng shi shou shu shua shuai shuan shuang shui shun shuo si song sou su
+    suan sui sun suo ta tai tan tang tao te teng ti tian tiao tie ting tong tou tu
+    tuan tui tun tuo wa wai wan wang wei wen weng wo wu xi xia xian xiang xiao xie
+    xin xing xiong xiu xu xuan xue xun ya yan yang yao ye yi yin ying yo yong you yu
+    yuan yue yun za zai zan zang zao ze zei zen zeng zha zhai zhan zhang zhao zhe zhei
+    zhen zheng zhi zhong zhou zhu zhua zhuai zhuan zhuang zhui zhun zhuo zi zong zou
+    zu zuan zui zun zuo""".split()
+)
+
+
+def _split_pinyin_run(run: str) -> list[str] | None:
+    """把连续拼音串 (带调) 从左到右按标准音节最大匹配切分。
+
+    run 长度 ≥8 (超过最长单音节 7), 若整体可切分为多个合法音节则返回切分结果。
+    无法切分返回 None (不强行改)。
+    """
+    plain = run.translate(_TONE_STRIP).lower()
+    out: list[str] = []
+    i = 0
+    while i < len(plain):
+        best = None
+        for j in range(min(len(plain), i + 6), i, -1):
+            if plain[i:j] in _SYLLABLES:
+                best = (i, j)
+                break
+        if best is None:
+            return None
+        _, j = best
+        out.append(run[i:j])
+        i = j
+    return out if len(out) >= 2 else None
+
+
+def _fix_pinyin_glue(text: str) -> str:
+    """修复相邻拼音粘连: 汉字+连续拼音(≥8字符)+汉字 → 按音节切分插空格。
+
+    例: 银hángchóng新 → 银háng chóng新 (háng|chóng 两个音节)
+    """
+    def repl(m: re.Match) -> str:
+        run = m.group(1)
+        parts = _split_pinyin_run(run)
+        if parts is None:
+            return run
+        return " ".join(parts)
+
+    return re.sub(rf"([{_PIN_CHARS}]{{8,}})", repl, text)
+
+
 def _apply_edits(original: str, edits: list[Edit]) -> str:
-    """应用编辑。replace: 基于原文定位, 从右到左替换, 重叠编辑丢弃后提交的。"""
-    # 1. 在原文上定位所有 replace (按提交顺序), 重叠的跳过
-    taken: list[tuple[int, int]] = []  # 已占用的 (start, end) 区间
-    located: list[tuple[int, int, Edit]] = []
+    """应用编辑。replace: 基于原文定位, 从右到左替换。
+
+    重叠处理:
+    - 新 edit 完全覆盖旧 edit 的区间 → 新 edit 优先, 移除被覆盖的旧 edit
+      (允许 LLM 用一条大 edit 整体替换分散的逐字标注, 如 粘连修复)
+    - 部分重叠 → 后提交者丢弃 (治 DRAM→\"D R A MA M\" 碎片)
+    """
+    # 1. 在原文上定位所有 replace, 处理重叠
+    taken: list[tuple[int, int, Edit]] = []
     for e in edits:
         if e.kind != "replace":
             continue
@@ -302,13 +596,19 @@ def _apply_edits(original: str, edits: list[Edit]) -> str:
         if idx < 0:
             continue
         end = idx + len(e.find)
-        if any(s < end and idx < en for s, en in taken):
-            continue  # 与已接受编辑重叠, 丢弃
-        taken.append((idx, end))
-        located.append((idx, len(e.find), e))
+        # 移除被本 edit 完全覆盖的旧 edit
+        taken = [t for t in taken if not (idx <= t[0] and t[1] <= end)]
+        # 部分重叠 (本 edit 与任何保留的旧 edit 有交集但未完全覆盖) → 丢弃本 edit
+        if any(s < end and idx < en for s, en, _ in taken):
+            continue
+        taken.append((idx, end, e))
     # 2. 从右到左替换 (位置基于原文, 不漂移)
     out = original
-    for idx, length, e in sorted(located, key=lambda t: t[0], reverse=True):
+    for idx, length, e in sorted(
+        ((idx, en - idx, e) for idx, en, e in taken),
+        key=lambda t: t[0],
+        reverse=True,
+    ):
         out = out[:idx] + e.to + out[idx + length:]
     # 3. pause: 在 find 后插入空格或逗号 (在替换结果上重新定位, 片段通常不受 replace 影响)
     for e in edits:
@@ -365,7 +665,7 @@ def _build_agent(state: HarnessState) -> Agent:
     model = _get_model()
     agent = Agent(model, name="normalize_editor", system_prompt=SYSTEM_PROMPT)
 
-    @agent.tool_plain
+    @agent.tool_plain(retries=3)
     def submit_edit(find: str, occurrence: int, to: str, rule: str, pinyin: str = "") -> str:
         """提交一条替换编辑。find 必须是原文精确子串 (≥2字符); occurrence 为第几次出现 (0-based); to 为替换文本; rule 为规则类别 (TN/POLY/ABBR/PAUSE/CLEAN); pinyin 可选 — 多音字标注时给出读音 (如 chēng/cheng1/cheng), 程序校验并规范格式。"""
         _validate_edit(state, find, occurrence, to)
@@ -428,14 +728,34 @@ def _build_agent(state: HarnessState) -> Agent:
     return agent
 
 
+# ---------- 内存 cache (按输入文本) ----------
+_NORM_CACHE: dict[str, str] = {}
+_NORM_CACHE_MAX = 2000
+
+
+def _cache_put(text: str, result: str) -> None:
+    """写入 cache, FIFO 淘汰 (超上限删最早插入的)。"""
+    _NORM_CACHE[text] = result
+    while len(_NORM_CACHE) > _NORM_CACHE_MAX:
+        _NORM_CACHE.pop(next(iter(_NORM_CACHE)))
+
+
 async def normalize_sentence(text: str) -> str:
     """单句归一化入口 (与旧 normalizer.normalize_sentence 同签名, 直接替换)。
 
+    内存 cache: 相同输入直接返回历史结果 (FIFO, 上限 _NORM_CACHE_MAX)。
     失败抛异常, 由调用方 (tts.py endpoint) 决定降级。
     """
+    global _NORM_CACHE
+    hit = _NORM_CACHE.get(text)
+    if hit is not None:
+        logger.info("[normalize] cache hit | in: %s", text)
+        return hit
+
     if _get_model() is None:
         return text
 
+    _t0 = time.monotonic()
     text = _deterministic_preprocess(text)  # 程序侧规则先跑: B2B → B to B
     state = HarnessState(original=text)
     agent = _build_agent(state)
@@ -461,10 +781,23 @@ async def normalize_sentence(text: str) -> str:
     )
 
     if not state.edits:
+        logger.info(
+            "[normalize] no edits %.2fs | in: %s", time.monotonic() - _t0, text
+        )
+        _cache_put(text, text)
         return text  # 模型判断无需编辑
 
     final = _apply_edits(text, state.edits)
     if not _digit_conservation_ok(text, final):
         logger.warning(f"harness digit conservation failed, fallback original: {text[:50]}")
         return text
-    return re.sub(r" {2,}", " ", final)  # 压缩连续空格 (停顿插在已有空格后)
+    final = re.sub(r" {2,}", " ", final)  # 压缩连续空格 (停顿插在已有空格后)
+    final = _fix_pinyin_glue(final)  # 相邻拼音按音节切分插空格 (银hángchóng新→银háng chóng新)
+    logger.info(
+        "[normalize] %.2fs | in: %s\n[normalize] out: %s",
+        time.monotonic() - _t0,
+        text,
+        final,
+    )
+    _cache_put(text, final)
+    return final
