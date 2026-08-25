@@ -76,6 +76,10 @@ unit:
 model:
   YOLO: YOLO            # 缩读词, 整体读 (you only live once), 不拆字母
   YOLO11: YOLO 十一
+  SoAT: SO TA           # 拼读词, 读作 "so-ta"
+  RoPE: RoPE            # 缩读词 (Rotary Positional Embedding), 读作 "rope"
+  NoRope: No rope       # 缩读词 + 否定前缀
+  GW: G 瓦               # 单位, 字母后接中文量词 (同 GHz → G 赫兹)
   GLM-5.3: G L M 五点三
   GLM-5.2: G L M 五点二
   GLM-4.7: G L M 四点七
